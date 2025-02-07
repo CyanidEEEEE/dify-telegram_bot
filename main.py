@@ -350,7 +350,16 @@ async def process_message_queue(application: Application):
 
 async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /start 命令。"""
-    await update.message.reply_text("你好呀！")
+    welcome_message = """
+你好呀！
+
+你可以向我发送文本、图片、语音或文档，我会尽力理解你的意思。
+
+如果你想切换聊天对象，可以使用 /set 命令，例如：/set dave
+
+准备好开始聊天了吗？😊
+    """
+    await update.message.reply_text(welcome_message)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """错误处理程序。"""
