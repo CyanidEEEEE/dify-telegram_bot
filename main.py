@@ -13,15 +13,13 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-# 请在环境变量中设置 TELEGRAM_BOT_TOKEN, DIFY_API_URL, HTTP_PROXY (可选)
-TELEGRAM_BOT_TOKEN = "7527:AAGpkSGc1"  # 替换为你的机器人 Token
-DIFY_API_URL = "http://"  # 替换为你的 Dify API 地址
+TELEGRAM_BOT_TOKEN = "7598188:AAuNGPI"  # 替换为你的机器人 Token
+DIFY_API_URL = "http://192"  # 替换为你的 Dify API 地址
 HTTP_PROXY = "http://127.0.0.1:10808"  # 如果需要，设置 HTTP 代理
 
-# 默认 API 密钥及其别名。在环境变量'API_KEYS'中设置,格式如 dave:app-xxx,dean:app-xxx
 API_KEYS = {
-    "dave": "app-efewfwefewfwefwe",  # 替换为你的 Dify API 密钥
-    "dean": "app-rergregetge",  # 替换为你的 Dify API 密钥
+    "dave": "app-YhesWAl62s7miX",  # 替换为你的 Dify API 密钥
+    "dean": "app-o7m7R3g587g",  # 替换为你的 Dify API 密钥
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
@@ -40,9 +38,9 @@ SUPPORTED_DOCUMENT_MIME_TYPES = [
     "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ]
 
-DATA_FILE = "bot_data.pickle"  # 数据存储文件名
+DATA_FILE = "bot_data.pickle"
 
-# 连接状态标记
+# 新增：连接状态标记
 is_connected = True
 
 def load_data():
@@ -78,7 +76,7 @@ conversation_ids_by_key, api_keys, user_api_keys = load_data()
 def get_user_api_key(user_id: str):
     """获取用户当前使用的 API Key 和别名。"""
     alias = user_api_keys.get(user_id, DEFAULT_API_KEY_ALIAS)
-    return api_keys.get(alias, api_keys.get(DEFAULT_API_KEY_ALIAS, "")), alias
+    return api_keys.get(alias, api_keys[DEFAULT_API_KEY_ALIAS]), alias
 
 
 async def set_api_key(update: telegram.Update, context: CallbackContext):
@@ -110,7 +108,7 @@ async def upload_file_to_dify(file_bytes, file_name, mime_type, user_id):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(trust_env=False, timeout=60, proxies=HTTP_PROXY if HTTP_PROXY else None) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=60) as client:
                 response = await client.post(upload_url, headers=headers, files=files)
                 if response.status_code == 201:
                     return response.json()
@@ -142,7 +140,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(trust_env=False, timeout=60, proxies=HTTP_PROXY if HTTP_PROXY else None) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=60) as client:
                 response = await client.post(DIFY_API_URL + "/chat-messages", headers=headers, json=data)
                 if response.status_code == 200:
                     print(f"Dify API status code: 200 OK")
@@ -257,68 +255,97 @@ async def process_message_queue(application: Application):
         update, context, message_type, message_content, file_info = await message_queue.get()
         user_id, chat_id, bot = str(update.effective_user.id), update.effective_chat.id, context.bot
 
-        # 在处理消息前检查连接状态
+        # 检查连接状态
         if not is_connected:
             print("Telegram 连接断开，消息处理暂停。")
             await message_queue.put((update, context, message_type, message_content, file_info))
             message_queue.task_done()
-            await asyncio.sleep(1)  # 稍作等待
+            await asyncio.sleep(1)
             continue
 
-        current_time, last_processed_time = time.time(), user_last_processed_time.get(user_id, 0)
-        if current_time - last_processed_time < rate_limit:
-            remaining_time = rate_limit - (current_time - last_processed_time)
-            print(f"用户 {user_id} 触发速率限制, 剩余等待时间: {remaining_time:.2f} 秒")
+        # 记录消息到达时间 (用于基本速率限制)
+        message_arrival_time = time.time()
+        last_processed_time = user_last_processed_time.get(user_id, 0)
+
+        if message_arrival_time - last_processed_time < rate_limit:
+            remaining_time = rate_limit - (message_arrival_time - last_processed_time)
+            print(f"用户 {user_id} 触发基本速率限制, 剩余等待时间: {remaining_time:.2f} 秒")
             await asyncio.sleep(remaining_time)
+
+        # --- 核心逻辑：合并队列中该用户的所有消息 ---
+        collected_text = ""
+        collected_files = []
+
+        # 首先处理当前消息
         if message_type == "sticker":
             await bot.send_message(chat_id=chat_id, text="看不懂你发的啥意思耶")
-            message_queue.task_done()
-            user_last_processed_time[user_id] = time.time()
-            continue
-        collected_messages = [(message_type, message_content, file_info)]
+        elif message_type == "text":
+            collected_text += (message_content if message_content else "") + "\n"
+        elif message_type in ("photo", "voice", "document"):
+            if message_content:
+                collected_text += message_content + "\n"  # 添加 caption
+            try:
+                if message_type == "photo":
+                    file = await bot.get_file(file_info['file_id'])
+                    file_bytes = await file.download_as_bytearray()
+                    file_info['file_name'] = f"photo_{uuid.uuid4()}.jpg"
+                elif message_type == "voice":
+                    file = await bot.get_file(file_info['file_id'])
+                    file_bytes = await file.download_as_bytearray()
+                elif message_type == "document":
+                    file = await bot.get_file(file_info['file_id'])
+                    file_bytes = await file.download_as_bytearray()
+                upload_result = await upload_file_to_dify(bytes(file_bytes), file_info['file_name'], file_info['mime_type'], user_id)
+                if upload_result and upload_result.get("id"):
+                    collected_files.append({"type": file_info['file_type'], "transfer_method": "local_file", "upload_file_id": upload_result["id"]})
+            except Exception as e:
+                print(f"文件上传/处理错误: {e}")
+                await bot.send_message(chat_id=chat_id, text="处理文件时出错。")
+                #  continue  <--  这里不能 continue，因为后面还要检查队列
+
+        # 然后，循环检查并合并后续消息
         while not message_queue.empty():
             try:
                 next_update, next_context, next_message_type, next_message_content, next_file_info = message_queue.get_nowait()
-                if next_message_type == "sticker":
-                    await message_queue.put((next_update, next_context, next_message_type, next_message_content, next_file_info))
-                    break
-                if str(next_update.effective_user.id) == user_id and time.time() - last_processed_time < rate_limit:
-                    collected_messages.append((next_message_type, next_message_content, next_file_info))
+                if str(next_update.effective_user.id) == user_id:
+                    if next_message_type == "sticker":
+                        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥意思耶")
+                    elif next_message_type == "text":
+                        collected_text += (next_message_content if next_message_content else "") + "\n"
+                    elif next_message_type in ("photo", "voice", "document"):
+                        if next_message_content:
+                            collected_text += next_message_content + "\n"
+                        try:
+                            if next_message_type == "photo":
+                                file = await bot.get_file(next_file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                                next_file_info['file_name'] = f"photo_{uuid.uuid4()}.jpg"
+                            elif next_message_type == "voice":
+                                file = await bot.get_file(next_file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                            elif next_message_type == "document":
+                                file = await bot.get_file(next_file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                            upload_result = await upload_file_to_dify(bytes(file_bytes), next_file_info['file_name'], next_file_info['mime_type'], user_id)
+                            if upload_result and upload_result.get("id"):
+                                collected_files.append({"type": next_file_info['file_type'], "transfer_method": "local_file", "upload_file_id": upload_result["id"]})
+                        except Exception as e:
+                            print(f"文件上传/处理错误: {e}")
+                            await bot.send_message(chat_id=chat_id, text="处理文件时出错。")
+                            # continue  <-- 这里也不能 continue
+
                     message_queue.task_done()
                 else:
                     await message_queue.put((next_update, next_context, next_message_type, next_message_content, next_file_info))
                     break
             except asyncio.QueueEmpty:
                 break
-        combined_text, combined_files = "", []
-        for msg_type, msg_content, msg_file_info in collected_messages:
-            if msg_type == "text" and msg_content:
-                combined_text += msg_content + "\n"
-            elif msg_type in ("photo", "voice", "document") and msg_file_info:
-                if msg_content:
-                    combined_text += msg_content + "\n"
-                try:
-                    if msg_type == "photo":
-                        file = await bot.get_file(msg_file_info['file_id'])
-                        file_bytes = await file.download_as_bytearray()
-                        msg_file_info['file_name'] = f"photo_{uuid.uuid4()}.jpg"
-                    elif msg_type == "voice":
-                        file = await bot.get_file(msg_file_info['file_id'])
-                        file_bytes = await file.download_as_bytearray()
-                    elif msg_type == "document":
-                        file = await bot.get_file(msg_file_info['file_id'])
-                        file_bytes = await file.download_as_bytearray()
-                    upload_result = await upload_file_to_dify(bytes(file_bytes), msg_file_info['file_name'], msg_file_info['mime_type'], user_id)
-                    if upload_result and upload_result.get("id"):
-                        combined_files.append({"type": msg_file_info['file_type'], "transfer_method": "local_file", "upload_file_id": upload_result["id"]})
-                except Exception as e:
-                    print(f"文件上传/处理错误: {e}")
-                    await bot.send_message(chat_id=chat_id, text="处理文件时出错。")
-                    continue
-        if combined_text.strip() or combined_files:
-            print(f"合并消息: {combined_text}, 文件: {combined_files}")
-            await dify_stream_response(combined_text.strip(), chat_id, bot, files=combined_files)
-        user_last_processed_time[user_id] = time.time()
+
+        if collected_text.strip() or collected_files:
+            print(f"合并消息: {collected_text}, 文件: {collected_files}")
+            await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
+
+        user_last_processed_time[user_id] = time.time()  # 更新时间戳
         message_queue.task_done()
 
 async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,15 +439,13 @@ async def connect_telegram():
 
 async def main() -> None:
     """主函数。"""
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         print("请设置 TELEGRAM_BOT_TOKEN")
         return
-    if not DIFY_API_URL:
+    if not DIFY_API_URL or DIFY_API_URL == "YOUR_DIFY_API_URL":
         print("请设置 DIFY_API_URL")
         return
-    if not API_KEYS:
-        print("请设置 API_KEYS")
-        return
+
     await connect_telegram()
 
 
