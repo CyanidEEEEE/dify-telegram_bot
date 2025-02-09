@@ -108,7 +108,7 @@ async def upload_file_to_dify(file_bytes, file_name, mime_type, user_id):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(trust_env=False, timeout=60) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=180) as client:
                 response = await client.post(upload_url, headers=headers, files=files)
                 if response.status_code == 201:
                     return response.json()
@@ -140,7 +140,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(trust_env=False, timeout=60) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=180) as client:
                 response = await client.post(DIFY_API_URL + "/chat-messages", headers=headers, json=data)
                 if response.status_code == 200:
                     print(f"Dify API status code: 200 OK")
