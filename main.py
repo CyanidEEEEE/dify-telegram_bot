@@ -13,13 +13,13 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-TELEGRAM_BOT_TOKEN = "7598188:AAuNGPI"  # 替换为你的机器人 Token
-DIFY_API_URL = "http://192"  # 替换为你的 Dify API 地址
-HTTP_PROXY = "http://127.0.0.1:10808"  # 如果需要，设置 HTTP 代理
+TELEGRAM_BOT_TOKEN = "75981q4BuNGPI"
+DIFY_API_URL = "http://192.168.235.252/v1"
+HTTP_PROXY = "http://127.0.0.1:10808"
 
 API_KEYS = {
-    "dave": "app-YhesWAl62s7miX",  # 替换为你的 Dify API 密钥
-    "dean": "app-o7m7R3g587g",  # 替换为你的 Dify API 密钥
+    "dave": "app-WAxYjRuxV0",
+    "dean": "app-o7mFNTR587g",
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
@@ -27,9 +27,9 @@ DEFAULT_API_KEY_ALIAS = "dave"
 # --- 代码部分 ---
 
 message_queue = asyncio.Queue()
-rate_limit = 30  # 速率限制，单位：秒
+rate_limit = 60
 user_last_processed_time = {}
-segment_regex = r".*?[。？！~…]+|.+$"  # 分段正则表达式
+segment_regex = r".*?[。？！~…]+|.+$"
 
 SUPPORTED_DOCUMENT_MIME_TYPES = [
     "text/plain", "application/pdf", "application/msword",
@@ -40,7 +40,6 @@ SUPPORTED_DOCUMENT_MIME_TYPES = [
 
 DATA_FILE = "bot_data.pickle"
 
-# 新增：连接状态标记
 is_connected = True
 
 def load_data():
@@ -48,10 +47,10 @@ def load_data():
     try:
         with open(DATA_FILE, "rb") as f:
             data = pickle.load(f)
-            conversation_ids_by_key = data.get('conversation_ids_by_key', {})
+            conversation_ids_by_user = data.get('conversation_ids_by_user', {})
             api_keys = data.get('api_keys', API_KEYS)
             user_api_keys = data.get('user_api_keys', {})
-            return conversation_ids_by_key, api_keys, user_api_keys
+            return conversation_ids_by_user, api_keys, user_api_keys
     except (FileNotFoundError, EOFError, pickle.UnpicklingError) as e:
         print(f"Error loading data from {DATA_FILE}: {e}, using default values.")
         return {}, API_KEYS, {}
@@ -60,17 +59,17 @@ def load_data():
         return {}, API_KEYS, {}
 
 
-def save_data(conversation_ids_by_key, api_keys, user_api_keys):
+def save_data(conversation_ids_by_user, api_keys, user_api_keys):
     """保存会话数据和 API 密钥。"""
     data = {
-        'conversation_ids_by_key': conversation_ids_by_key,
+        'conversation_ids_by_user': conversation_ids_by_user,
         'api_keys': api_keys,
         'user_api_keys': user_api_keys
     }
     with open(DATA_FILE, "wb") as f:
         pickle.dump(data, f)
 
-conversation_ids_by_key, api_keys, user_api_keys = load_data()
+conversation_ids_by_user, api_keys, user_api_keys = load_data()
 
 
 def get_user_api_key(user_id: str):
@@ -83,15 +82,17 @@ async def set_api_key(update: telegram.Update, context: CallbackContext):
     """设置用户使用的 Dify API Key。"""
     user_id = str(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("请提供 API Key 的别名，例如：/set dave")
+        await update.message.reply_text("想换个人聊天？告诉我它的名字，比如：/set dave")
         return
     alias = context.args[0].lower()
     if alias in api_keys:
         user_api_keys[user_id] = alias
-        save_data(conversation_ids_by_key, api_keys, user_api_keys)
-        await update.message.reply_text(f"你的 Dify API Key 已切换为：{alias}")
+        if user_id in conversation_ids_by_user:
+            del conversation_ids_by_user[user_id]
+        save_data(conversation_ids_by_user, api_keys, user_api_keys)
+        await update.message.reply_text(f"好嘞，让 {alias} 来跟你聊吧！")  # 更自然的表达
     else:
-        await update.message.reply_text(f"未找到名为 '{alias}' 的 API Key。")
+        await update.message.reply_text(f"呃，我不认识叫 '{alias}' 的家伙。")
 
 def segment_text(text, segment_regex):
     """将文本分段，以便逐段发送。"""
@@ -126,8 +127,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
     """向 Dify 发送消息并处理流式响应。"""
     user_id = str(chat_id)
     current_api_key, current_api_key_alias = get_user_api_key(user_id)
-    current_conversation_ids = conversation_ids_by_key.get(current_api_key_alias, {})
-    conversation_id = current_conversation_ids.get(str(chat_id))
+    conversation_id = conversation_ids_by_user.get(user_id)
 
     headers = {"Authorization": f"Bearer {current_api_key}"}
     data = {"inputs": {}, "query": user_message, "user": str(chat_id), "response_mode": "streaming", "files": files if files else []}
@@ -138,13 +138,16 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
         print(f"Starting new conversation: {chat_id=}")
     full_text_response = ""
     max_retries = 3
-    for attempt in range(max_retries):
+    retry_count = 0
+
+    while retry_count <= max_retries:
         try:
             async with httpx.AsyncClient(trust_env=False, timeout=180) as client:
                 response = await client.post(DIFY_API_URL + "/chat-messages", headers=headers, json=data)
                 if response.status_code == 200:
                     print(f"Dify API status code: 200 OK")
                     first_chunk_received = False
+                    empty_response_count = 0
                     async for chunk in response.aiter_lines():
                         if chunk.strip() == "":
                             continue
@@ -156,17 +159,18 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                     first_chunk_received = True
                                     response_conversation_id = response_data.get("conversation_id")
                                     if response_conversation_id:
-                                        current_conversation_ids[str(chat_id)] = response_conversation_id
-                                        conversation_ids_by_key[current_api_key_alias] = current_conversation_ids
-                                        save_data(conversation_ids_by_key, api_keys, user_api_keys)
-                                        print(f"Stored conversation_id: {response_conversation_id}")
+                                        conversation_ids_by_user[user_id] = response_conversation_id
+                                        save_data(conversation_ids_by_user, api_keys, user_api_keys)
+                                        print(f"Stored conversation_id: {response_conversation_id} for user: {user_id}")
                                     else:
                                         print("Warning: conversation_id not found in the first chunk!")
+
                                 if event == "message_file":
                                     file_url, file_type = response_data.get("url"), response_data.get("type")
                                     if file_url and file_type == "image":
                                         await bot.send_photo(chat_id=chat_id, photo=file_url)
                                         print(f"Sent image: {file_url}")
+                                        empty_response_count = 0
                                 elif event == "tts_message":
                                     audio_base64 = response_data.get("audio")
                                     if audio_base64:
@@ -182,46 +186,86 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                                 print("Sent as document.")
                                             except Exception as doc_err:
                                                 print(f"Error sending document as voice: {doc_err}")
+                                        empty_response_count = 0
                                 elif event == "message":
                                     text_chunk = response_data.get("answer", "")
                                     if text_chunk:
                                         full_text_response += text_chunk
+                                        empty_response_count = 0
+                                    else:
+                                        print("Warning: Received 'message' event with no answer.")
+                                        empty_response_count += 1
+                                else:
+                                  print(f"Received event: {event}")
+                                  empty_response_count +=1
                             except json.JSONDecodeError as e:
                                 print(f"JSONDecodeError: {e}")
                                 print(f"Invalid chunk: {chunk}")
+                                empty_response_count += 1
+
+                            if empty_response_count >= 3:
+                                print("Warning: Received multiple consecutive empty responses. Breaking the loop.")
+                                break
                         else:
                             print(f"Non-data chunk received: {chunk}")
-                    segments = segment_text(full_text_response, segment_regex)
-                    for i, segment in enumerate(segments):
-                        print(f"Segment to Send: {segment}")
-                        await bot.send_message(chat_id=chat_id, text=segment)
-                        if i < len(segments) - 1:
-                            delay = random.uniform(1, 3)
-                            print(f"Waiting for {delay:.2f}s")
-                            await asyncio.sleep(delay)
+
+                    if full_text_response.strip():
+                        segments = segment_text(full_text_response, segment_regex)
+                        for i, segment in enumerate(segments):
+                            await bot.send_message(chat_id=chat_id, text=segment)
+                            if i < len(segments) - 1:
+                                delay = random.uniform(1, 3)
+                                print(f"Waiting for {delay:.2f}s")
+                                await asyncio.sleep(delay)
+                    else:
+                        await bot.send_message(chat_id=chat_id, text="哎呀，没听清，能再说一遍吗？")  # 更自然的空回复
                     return
+
+                elif response.status_code == 404:
+                    error_details = response.json()
+                    if error_details.get('code') == 'not_found' and error_details.get('message') == 'Conversation Not Exists.':
+                        print(f"Received 404 Conversation Not Exists for user {user_id}.")
+                        if user_id in conversation_ids_by_user:
+                            del conversation_ids_by_user[user_id]
+                            save_data(conversation_ids_by_user, api_keys, user_api_keys)
+
+                        await bot.send_message(chat_id=chat_id, text="哎呀，刚才聊到哪儿了？我们重新开始吧！")  # 更自然的对话过期
+                        retry_count += 1
+                        data.pop("conversation_id", None)
+                        print(f"Retrying without conversation_id, attempt {retry_count}...")
+                        continue
+
+                    else:
+                        print(f"Dify API status code: {response.status_code} Error")
+                        error_message = f"Dify API 出了点问题（{response.status_code}），稍后再试试吧。"  # 更自然的错误信息
+                        error_message += f" 详细信息：{error_details}"
+                        await bot.send_message(chat_id=chat_id, text=error_message)
+                        break
+
+
                 else:
                     print(f"Dify API status code: {response.status_code} Error")
-                    error_message = f"Dify API request failed with status code: {response.status_code}"
+                    error_message = f"哎呀，Dify API 出了点问题（{response.status_code}），稍后再试试吧。"  # 更自然的错误信息
                     try:
                         error_details = response.json()
-                        error_message += f", Details: {error_details}"
-                        print(f"Error details: {error_details}")
+                        error_message += f" 详细信息：{error_details}"
                     except (httpx.HTTPError, json.JSONDecodeError):
-                        error_message += ", Could not decode error response."
-                        print("Could not decode error response.")
+                        error_message += " 无法获取详细错误信息。"
                     await bot.send_message(chat_id=chat_id, text=error_message)
                     break
         except (httpx.RequestError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            print(f"Dify API 请求失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
-                await bot.send_message(chat_id=chat_id, text=f"与 Dify API 通信失败。")
+            print(f"Dify API 请求失败 (尝试 {retry_count + 1}/{max_retries}): {e}")
+            if retry_count == max_retries - 1:
+                await bot.send_message(chat_id=chat_id, text=f"网络好像不太好，试了好几次都没发出去消息，稍后再试试吧。")  # 更自然的连接失败
                 print("达到最大重试次数。")
                 return
             await asyncio.sleep(5)
+            retry_count += 1
+
+
         except Exception as e:
             print(f"Unexpected error: {e}")
-            await bot.send_message(chat_id=chat_id, text=f"发生意外错误: {e}")
+            await bot.send_message(chat_id=chat_id, text=f"发生了一些奇怪的错误：{e}，稍后再联系吧！") # 更自然的意外错误
             return
 
 async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -229,7 +273,7 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
     message, chat_id, bot = update.message, update.effective_chat.id, context.bot
     if message.document:
         if message.document.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
-            await bot.send_message(chat_id=chat_id, text="这个文件类型我打不开哦，抱歉。")
+            await bot.send_message(chat_id=chat_id, text="这个文件我打不开呀，抱歉啦。")  # 更自然的拒绝
             return
     message_type, message_content, file_info = "unknown", None, None
     if message.text:
@@ -255,7 +299,6 @@ async def process_message_queue(application: Application):
         update, context, message_type, message_content, file_info = await message_queue.get()
         user_id, chat_id, bot = str(update.effective_user.id), update.effective_chat.id, context.bot
 
-        # 检查连接状态
         if not is_connected:
             print("Telegram 连接断开，消息处理暂停。")
             await message_queue.put((update, context, message_type, message_content, file_info))
@@ -263,7 +306,6 @@ async def process_message_queue(application: Application):
             await asyncio.sleep(1)
             continue
 
-        # 记录消息到达时间 (用于基本速率限制)
         message_arrival_time = time.time()
         last_processed_time = user_last_processed_time.get(user_id, 0)
 
@@ -272,18 +314,16 @@ async def process_message_queue(application: Application):
             print(f"用户 {user_id} 触发基本速率限制, 剩余等待时间: {remaining_time:.2f} 秒")
             await asyncio.sleep(remaining_time)
 
-        # --- 核心逻辑：合并队列中该用户的所有消息 ---
         collected_text = ""
         collected_files = []
 
-        # 首先处理当前消息
         if message_type == "sticker":
-            await bot.send_message(chat_id=chat_id, text="看不懂你发的啥意思耶")
+            await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏")  # 更自然的表情回复
         elif message_type == "text":
             collected_text += (message_content if message_content else "") + "\n"
         elif message_type in ("photo", "voice", "document"):
             if message_content:
-                collected_text += message_content + "\n"  # 添加 caption
+                collected_text += message_content + "\n"
             try:
                 if message_type == "photo":
                     file = await bot.get_file(file_info['file_id'])
@@ -300,16 +340,14 @@ async def process_message_queue(application: Application):
                     collected_files.append({"type": file_info['file_type'], "transfer_method": "local_file", "upload_file_id": upload_result["id"]})
             except Exception as e:
                 print(f"文件上传/处理错误: {e}")
-                await bot.send_message(chat_id=chat_id, text="处理文件时出错。")
-                #  continue  <--  这里不能 continue，因为后面还要检查队列
+                await bot.send_message(chat_id=chat_id, text="处理文件的时候出了点小问题...")
 
-        # 然后，循环检查并合并后续消息
         while not message_queue.empty():
             try:
                 next_update, next_context, next_message_type, next_message_content, next_file_info = message_queue.get_nowait()
                 if str(next_update.effective_user.id) == user_id:
                     if next_message_type == "sticker":
-                        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥意思耶")
+                        await bot.send_message(chat_id=chat_id, text="哈哈，你发的表情包真逗！")
                     elif next_message_type == "text":
                         collected_text += (next_message_content if next_message_content else "") + "\n"
                     elif next_message_type in ("photo", "voice", "document"):
@@ -331,8 +369,7 @@ async def process_message_queue(application: Application):
                                 collected_files.append({"type": next_file_info['file_type'], "transfer_method": "local_file", "upload_file_id": upload_result["id"]})
                         except Exception as e:
                             print(f"文件上传/处理错误: {e}")
-                            await bot.send_message(chat_id=chat_id, text="处理文件时出错。")
-                            # continue  <-- 这里也不能 continue
+                            await bot.send_message(chat_id=chat_id, text="处理文件的时候出了点小问题...")
 
                     message_queue.task_done()
                 else:
@@ -345,19 +382,19 @@ async def process_message_queue(application: Application):
             print(f"合并消息: {collected_text}, 文件: {collected_files}")
             await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
 
-        user_last_processed_time[user_id] = time.time()  # 更新时间戳
+        user_last_processed_time[user_id] = time.time()
         message_queue.task_done()
 
 async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理 /start 命令。"""
     welcome_message = """
-你好呀！
+哈喽！我是你的聊天小助手！
 
-你可以向我发送文本、图片、语音或文档，我会尽力理解你的意思。
+可以给我发文字、图片、语音或者文件哦，我会尽力理解的。
 
-如果你想切换聊天对象，可以使用 /set 命令，例如：/set dave
+想换个人聊？用 /set 命令，比如：/set dave
 
-准备好开始聊天了吗？😊
+准备好跟我聊天了吗？😊
     """
     await update.message.reply_text(welcome_message)
 
@@ -365,27 +402,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """错误处理程序。"""
     print(f"Exception while handling an update: {context.error}")
     if update and update.effective_chat:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="处理消息时发生了一些错误。")
-
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="哎呀，出错了，稍后再找我吧。")  # 更自然的通用错误
 
 async def check_queue_size(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """检查消息队列大小。"""
     print(f"当前队列大小 (手动检查): {message_queue.qsize()}")
-    await update.message.reply_text(f"当前队列大小: {message_queue.qsize()}")
+    await update.message.reply_text(f"现在有 {message_queue.qsize()} 条消息在排队等着我呢。")  # 更自然的队列大小
 
 async def check_connection(application: Application) -> bool:
     """心跳检测：尝试获取机器人的信息。"""
     global is_connected
     try:
-        # 使用 get_me() 方法，这是一个轻量级的检查连接的方法
         await application.bot.get_me()
         if not is_connected:
             print("Telegram 连接恢复!")
-        is_connected = True  # 连接正常
+        is_connected = True
         return True
     except TelegramError as e:
         print(f"心跳检测失败: {e}")
-        is_connected = False  # 连接可能断开
+        is_connected = False
         return False
     except Exception as e:
         print(f"心跳检测期间发生意外错误: {e}")
@@ -408,31 +443,28 @@ async def connect_telegram():
                 await application.start()
                 await application.updater.start_polling()
 
-                # 启动消息处理队列
                 asyncio.create_task(process_message_queue(application))
 
                 print("Bot started. Press Ctrl+C to stop.")
 
-                # 主循环：定期进行心跳检测
                 while True:
                     if not await check_connection(application):
                         print("检测到 Telegram 连接断开，尝试重新连接...")
                         await application.updater.stop()
                         await application.stop()
-
-                        break  # 退出内层循环，重新连接
-                    await asyncio.sleep(30)  # 每 30 秒进行一次心跳检测
+                        break
+                    await asyncio.sleep(30)
 
         except (NetworkError, TimedOut) as e:
             print(f"Telegram 连接错误: {e}")
             print("尝试重新连接...")
-            is_connected = False  # 设置连接状态为断开
+            is_connected = False
             await asyncio.sleep(10)
 
         except asyncio.CancelledError:
             print("Stopping the bot...")
             if 'application' in locals():
-                save_data(conversation_ids_by_key, api_keys, user_api_keys)
+                save_data(conversation_ids_by_user, api_keys, user_api_keys)
                 await application.updater.stop()
                 await application.stop()
             break
@@ -441,7 +473,7 @@ async def connect_telegram():
             print(f"Unexpected error: {e}")
             is_connected = False
             if 'application' in locals():
-                save_data(conversation_ids_by_key, api_keys, user_api_keys)
+                save_data(conversation_ids_by_user, api_keys, user_api_keys)
                 await application.updater.stop()
                 await application.stop()
             break
@@ -463,4 +495,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped by user.")
-        save_data(conversation_ids_by_key, api_keys, user_api_keys)
+        save_data(conversation_ids_by_user, api_keys, user_api_keys)
