@@ -13,17 +13,13 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-TELEGRAM_BOT_TOKEN = "7598117688:AAFbNGMGKqNQUWRd-2ixKDMhl4BBSHuNGPI"  # 替换为你的 Telegram Bot Token
-DIFY_API_URL = "http://192.168.212.150/v1"  # 替换为你的 Dify API URL
+TELEGRAM_BOT_TOKEN = "759HGPI"  # 替换为你的 Telegram Bot Token
+DIFY_API_URL = "http://192.168.233.200/v1"  # 替换为你的 Dify API URL
 HTTP_PROXY = "http://127.0.0.1:10808"  # 替换为你的代理（如果需要）  # 未使用，但保留
-ADMIN_IDS = ["1086477603"]  # 替换为你的管理员 ID，可以有多个
+ADMIN_IDS = ["1063"]  # 替换为你的管理员 ID，可以有多个
 API_KEYS = {
-    "dave": "app-WAxYlivpOXw4YRjRugearxV0",
-    "dean": "app-o7mFNf4t7p493EsETR3g587g",
-    "tyson": "app-Kw3ijHYu2z2160qZPD2hDjQU",
-    "sal": "app-lGsD7shzClZit1GQbrJYFSVH",
-    "orlando": "app-5pg7iBfbA6OCr8WPZp5Tb2IG",
-    "leo": "app-Wo6lk6R6UdRNMZK0l7FOimcK",
+    "dave": "apV0",
+    "dean": "ap3g587g",
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
