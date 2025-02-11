@@ -13,13 +13,13 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-TELEGRAM_BOT_TOKEN = "759HGPI"  # 替换为你的 Telegram Bot Token
-DIFY_API_URL = "http://192.168.233.200/v1"  # 替换为你的 Dify API URL
-HTTP_PROXY = "http://127.0.0.1:10808"  # 替换为你的代理（如果需要）  # 未使用，但保留
-ADMIN_IDS = ["1063"]  # 替换为你的管理员 ID，可以有多个
+TELEGRAM_BOT_TOKEN = "759fKtEUA"  # 替换为你的 Telegram Bot Token
+DIFY_API_URL = "http://127"  # 替换为你的 Dify API URL
+HTTP_PROXY = "http://127"  # 替换为你的代理（如果需要）  # 未使用，但保留
+ADMIN_IDS = ["10"]  # 替换为你的管理员 ID，可以有多个
 API_KEYS = {
-    "dave": "apV0",
-    "dean": "ap3g587g",
+    "dave": "arxV0",
+    "dean": "ap7g",
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
@@ -41,6 +41,7 @@ SUPPORTED_DOCUMENT_MIME_TYPES = [
 DATA_FILE = "bot_data.pickle"
 
 is_connected = True  # 全局变量，用于跟踪 Telegram 连接状态
+telegram_application = None # 全局变量，用于存储 Application 实例
 
 
 def load_data():
@@ -212,6 +213,13 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                     else:
                                         print("Warning: Received 'message' event with no answer.")
                                         empty_response_count += 1
+                                elif event == "error":  #  处理 "error" 事件
+                                    print("Received event: error, clearing conversation_id and informing user.")
+                                    if user_id in conversation_ids_by_user:
+                                        del conversation_ids_by_user[user_id]
+                                        save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                                    await bot.send_message(chat_id=chat_id, text="啊，上次说话都好久以前了，我都快忘了说了啥子了。")
+                                    return  # 立即返回，停止当前请求
                                 else:
                                     print(f"Received event: {event}")
                                     empty_response_count += 1
@@ -505,50 +513,81 @@ async def clean_conversations(update: telegram.Update, context: CallbackContext)
     save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)  # 保存更改
     await update.message.reply_text("所有用户的聊天 ID 记录已清除。")
 
-async def connect_telegram():
-    """连接 Telegram 机器人并处理断线重连。"""
+async def check_telegram_connection(app: Application):
+    """每 60 秒检查 Telegram 连接状态。"""
     global is_connected
     while True:
+        await asyncio.sleep(60)  # 每 60 秒检查一次
         try:
-            application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            application.add_handler(CommandHandler("start", start))
-            application.add_handler(CommandHandler("set", set_api_key))
-            application.add_handler(CommandHandler("block", block_user))         # 添加 /block 命令
-            application.add_handler(CommandHandler("unblock", unblock_user))     # 添加 /unblock 命令
-            application.add_handler(CommandHandler("clean", clean_conversations))  # 添加 /clean 命令
-            application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-            application.add_error_handler(error_handler)
+            await app.bot.get_me()  # 尝试一个简单的 API 调用
+            if not is_connected:
+                is_connected = True
+                print("Telegram reconnected.")
+        except (NetworkError, TimedOut) as e:
+            if is_connected:
+                is_connected = False
+                print(f"Telegram connection lost: {e}")
+        except Exception as e:
+            if is_connected:
+                is_connected = False
+                print(f"Telegram connection check error: {e}")
 
-            async with application:
-                await application.start()
-                await application.updater.start_polling()
-                print("Bot started. Press Ctrl+C to stop.")
-                # 启动消息队列处理
-                asyncio.create_task(process_message_queue(application))
-                is_connected = True # 设置连接状态
+
+async def connect_telegram():
+    """连接 Telegram 机器人并处理断线重连。"""
+    global is_connected, telegram_application
+    while True:
+        try:
+            if telegram_application is None: # 首次或重连时创建新的 Application 实例
+                telegram_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+                telegram_application.add_handler(CommandHandler("start", start))
+                telegram_application.add_handler(CommandHandler("set", set_api_key))
+                telegram_application.add_handler(CommandHandler("block", block_user))         # 添加 /block 命令
+                telegram_application.add_handler(CommandHandler("unblock", unblock_user))     # 添加 /unblock 命令
+                telegram_application.add_handler(CommandHandler("clean", clean_conversations))  # 添加 /clean 命令
+                telegram_application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+                telegram_application.add_error_handler(error_handler)
+
+            async with telegram_application:
+                if not telegram_application.running: # 如果 Application 没有运行，则启动
+                    await telegram_application.start()
+                    await telegram_application.updater.start_polling()
+                    print("Bot started or re-started.")
+                    asyncio.create_task(check_telegram_connection(telegram_application)) # 启动心跳检测
+                    asyncio.create_task(process_message_queue(telegram_application)) # 启动消息队列处理
+                    is_connected = True # 设置连接状态
+
                 await asyncio.Future()  # 持续运行，直到被外部取消
 
         except (NetworkError, TimedOut) as e:
             print(f"Telegram 连接错误: {e}")
             print("尝试重新连接...")
             is_connected = False  # 更新连接状态
-            await asyncio.sleep(10)  # 等待一段时间后重试
+            if telegram_application and telegram_application.running:
+                await telegram_application.updater.stop() # 停止 updater
+                await telegram_application.stop() # 停止 application
+            telegram_application = None # 移除旧的 Application 实例，下次循环会重新创建
+            await asyncio.sleep(60)  # 等待 60 秒后重试
 
         except asyncio.CancelledError:
             print("Stopping the bot...")
-            if 'application' in locals():
+            if telegram_application:
                 save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users) # 退出前保存数据
-                await application.updater.stop()
-                await application.stop()
+                if telegram_application.running:
+                    await telegram_application.updater.stop()
+                    await telegram_application.stop()
             break
         except Exception as e:
             print(f"Unexpected error: {e}")
             is_connected = False
-            if 'application' in locals():
+            if telegram_application:
                 save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
-                await application.updater.stop()
-                await application.stop()
-            break
+                if telegram_application.running:
+                    await telegram_application.updater.stop()
+                    await telegram_application.stop()
+            telegram_application = None # 移除旧的 Application 实例，下次循环会重新创建
+            await asyncio.sleep(60) # 等待 60 秒后重试
+
 
 async def main() -> None:
     """主函数。"""
