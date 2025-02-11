@@ -3,6 +3,7 @@ from telegram.ext import Application, MessageHandler, filters, CommandHandler, C
 import httpx
 import json
 import os
+import sys
 import asyncio
 import uuid
 import re
@@ -13,13 +14,13 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-TELEGRAM_BOT_TOKEN = "759fKtEUA"  # 替换为你的 Telegram Bot Token
+TELEGRAM_BOT_TOKEN = "75tEUA"  # 替换为你的 Telegram Bot Token
 DIFY_API_URL = "http://127"  # 替换为你的 Dify API URL
-HTTP_PROXY = "http://127"  # 替换为你的代理（如果需要）  # 未使用，但保留
-ADMIN_IDS = ["10"]  # 替换为你的管理员 ID，可以有多个
+HTTP_PROXY = "http://12"  # 替换为你的代理（如果需要）  # 未使用，但保留
+ADMIN_IDS = ["63"]  # 替换为你的管理员 ID，可以有多个
 API_KEYS = {
-    "dave": "arxV0",
-    "dean": "ap7g",
+    "dave": "apV0",
+    "dean": "ap87g",
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
@@ -35,13 +36,14 @@ SUPPORTED_DOCUMENT_MIME_TYPES = [
     "text/plain", "application/pdf", "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ]
 
 DATA_FILE = "bot_data.pickle"
 
 is_connected = True  # 全局变量，用于跟踪 Telegram 连接状态
-telegram_application = None # 全局变量，用于存储 Application 实例
+telegram_application = None  # 全局变量，用于存储 Application 实例
 
 
 def load_data():
@@ -150,9 +152,10 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
     max_retries = 3  # 限制最大重试次数
     retry_count = 0
     consecutive_404_count = 0  # 连续 404 错误的计数器
-
+    timeout_seconds = 60  # 设置流式响应的超时时间
 
     while retry_count <= max_retries:
+        last_chunk_time = time.time()  # 记录接收到最后一个数据块的时间
         try:
             async with httpx.AsyncClient(trust_env=False, timeout=180) as client:
                 response = await client.post(DIFY_API_URL + "/chat-messages", headers=headers, json=data)
@@ -165,6 +168,9 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                     async for chunk in response.aiter_lines():
                         if chunk.strip() == "":
                             continue
+
+                        last_chunk_time = time.time()  # 更新时间
+
                         if chunk.startswith("data:"):
                             try:
                                 response_data = json.loads(chunk[5:])
@@ -175,7 +181,8 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                     if response_conversation_id:
                                         # 始终更新 conversation_id，即使它已经存在
                                         conversation_ids_by_user[user_id] = response_conversation_id
-                                        save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                                        save_data(conversation_ids_by_user, api_keys, user_api_keys,
+                                                  blocked_users)
                                         print(
                                             f"Stored/Updated conversation_id: {response_conversation_id} for user: {user_id}")
                                     else:
@@ -213,7 +220,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                     else:
                                         print("Warning: Received 'message' event with no answer.")
                                         empty_response_count += 1
-                                elif event == "error":  #  处理 "error" 事件
+                                elif event == "error":  # 处理 "error" 事件
                                     print("Received event: error, clearing conversation_id and informing user.")
                                     if user_id in conversation_ids_by_user:
                                         del conversation_ids_by_user[user_id]
@@ -231,6 +238,13 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                             if empty_response_count >= 3:
                                 print("Warning: Received multiple consecutive empty responses. Breaking the loop.")
                                 break
+
+                            # 检查流式响应超时
+                            if time.time() - last_chunk_time > timeout_seconds:
+                                print("Timeout during streaming. No data received.")
+                                response.close()  # 手动关闭连接
+                                raise httpx.ReadTimeout("No data received during streaming.")
+
                         else:
                             print(f"Non-data chunk received: {chunk}")
 
@@ -243,7 +257,8 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                 print(f"Waiting for {delay:.2f}s")
                                 await asyncio.sleep(delay)  # 控制消息发送间隔
                     else:
-                        await bot.send_message(chat_id=chat_id, text="呜呜，今天的流量已经用光了，刚充话费，到账需要时间，过一段时间再聊吧~")  # 更自然的空回复
+                        await bot.send_message(chat_id=chat_id,
+                                               text="呜呜，今天的流量已经用光了，刚充话费，到账需要时间，过一段时间再聊吧~")  # 更自然的空回复
                     return
 
                 elif response.status_code == 404:
@@ -284,7 +299,8 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                     await bot.send_message(chat_id=chat_id, text=error_message)
                     break
 
-        except (httpx.RequestError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+
+        except (httpx.RequestError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
             print(f"Dify API 请求失败 (尝试 {retry_count + 1}/{max_retries}): {e}")
             if retry_count == max_retries - 1:
                 await bot.send_message(chat_id=chat_id,
@@ -298,6 +314,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
             print(f"Unexpected error: {e}")
             await bot.send_message(chat_id=chat_id, text=f"发生了一些奇怪的错误：{e}，稍后再联系吧！")
             return
+
 
 async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """处理传入的 Telegram 消息。"""
@@ -362,7 +379,6 @@ async def process_message_queue(application: Application):
         bot = context.bot
         current_user_queue = []  # 存储当前用户的消息
 
-
         if not is_connected:  # 如果 Telegram 连接断开，则暂停处理
             print("Telegram 连接断开，消息处理暂停。")
             await message_queue.put((update, context, message_type, message_content, file_info))  # 放回队列
@@ -387,11 +403,13 @@ async def process_message_queue(application: Application):
             try:
                 next_update, next_context, next_message_type, next_message_content, next_file_info = message_queue.get_nowait()
                 if str(next_update.effective_user.id) == user_id:
-                    current_user_queue.append((next_update, next_context, next_message_type, next_message_content, next_file_info))
+                    current_user_queue.append((next_update, next_context, next_message_type, next_message_content,
+                                              next_file_info))
                     message_queue.task_done()
                 else:
                     # 如果不是来自同一用户的消息，则将其放回队列
-                    await message_queue.put((next_update, next_context, next_message_type, next_message_content, next_file_info))
+                    await message_queue.put(
+                        (next_update, next_context, next_message_type, next_message_content, next_file_info))
                     break
             except asyncio.QueueEmpty:
                 break
@@ -400,11 +418,11 @@ async def process_message_queue(application: Application):
         collected_files = []
 
         for update, context, message_type, message_content, file_info in current_user_queue:
-             if message_type == "sticker":
+            if message_type == "sticker":
                 await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏")  # 更自然的表情回复
-             elif message_type == "text":
+            elif message_type == "text":
                 collected_text += (message_content if message_content else "") + "\n"
-             elif message_type in ("photo", "voice", "document"):
+            elif message_type in ("photo", "voice", "document"):
                 if message_content:
                     collected_text += message_content + "\n"
                 try:
@@ -418,17 +436,28 @@ async def process_message_queue(application: Application):
                     elif message_type == "document":
                         file = await bot.get_file(file_info['file_id'])
                         file_bytes = await file.download_as_bytearray()
-                    upload_result = await upload_file_to_dify(bytes(file_bytes), file_info['file_name'], file_info['mime_type'], user_id)
+                    upload_result = await upload_file_to_dify(bytes(file_bytes), file_info['file_name'],
+                                                            file_info['mime_type'], user_id)
                     if upload_result and upload_result.get("id"):
-                        collected_files.append({"type": file_info['file_type'],"transfer_method": "local_file","upload_file_id": upload_result["id"]})
+                        collected_files.append({"type": file_info['file_type'], "transfer_method": "local_file",
+                                                "upload_file_id": upload_result["id"]})
                 except Exception as e:
                     print(f"文件上传/处理错误: {e}")
                     await bot.send_message(chat_id=chat_id, text="处理文件的时候出了点小问题...")
 
         # 5. 发送合并后的消息
-        if collected_text.strip() or collected_files:
-            print(f"合并消息: {collected_text}, 文件: {collected_files}")
-            await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
+        try:
+            if collected_text.strip() or collected_files:
+                print(f"合并消息: {collected_text}, 文件: {collected_files}")
+                await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
+        except Exception as e:  # 捕获 dify_stream_response 可能抛出的任何异常
+            print(f"Error in process_message_queue during dify_stream_response: {e}")
+            await bot.send_message(chat_id=chat_id, text="处理消息时发生错误，请稍后再试。")
+            # 清理可能残留的 conversation_id
+            if user_id in conversation_ids_by_user:
+                del conversation_ids_by_user[user_id]
+                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+
 
         # 6. 更新最后处理时间
         user_last_processed_time[user_id] = time.time()
@@ -494,12 +523,13 @@ async def unblock_user(update: telegram.Update, context: CallbackContext) -> Non
         target_user_id = str(context.args[0])
         if target_user_id in blocked_users:
             blocked_users.remove(target_user_id)  # 从黑名单移除
-            save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users) # 保存
+            save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)  # 保存
             await update.message.reply_text(f"用户 {target_user_id} 已被取消拉黑。")
         else:
             await update.message.reply_text(f"用户 {target_user_id} 不在黑名单中。")
     except (ValueError, KeyError):
         await update.message.reply_text("无效的用户 ID。")
+
 
 async def clean_conversations(update: telegram.Update, context: CallbackContext) -> None:
     """清除所有用户的聊天 ID 记录（管理员命令）。"""
@@ -513,8 +543,9 @@ async def clean_conversations(update: telegram.Update, context: CallbackContext)
     save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)  # 保存更改
     await update.message.reply_text("所有用户的聊天 ID 记录已清除。")
 
+
 async def check_telegram_connection(app: Application):
-    """每 60 秒检查 Telegram 连接状态。"""
+    """每 60 秒检查 Telegram 连接状态，并在重新连接后重启程序。"""
     global is_connected
     while True:
         await asyncio.sleep(60)  # 每 60 秒检查一次
@@ -522,7 +553,11 @@ async def check_telegram_connection(app: Application):
             await app.bot.get_me()  # 尝试一个简单的 API 调用
             if not is_connected:
                 is_connected = True
-                print("Telegram reconnected.")
+                print("Telegram reconnected. Restarting the program...")
+                # 重启程序
+                python = sys.executable
+                os.execv(python, [python] + sys.argv)
+
         except (NetworkError, TimedOut) as e:
             if is_connected:
                 is_connected = False
@@ -534,59 +569,47 @@ async def check_telegram_connection(app: Application):
 
 
 async def connect_telegram():
-    """连接 Telegram 机器人并处理断线重连。"""
+    """连接 Telegram 机器人。"""
     global is_connected, telegram_application
-    while True:
-        try:
-            if telegram_application is None: # 首次或重连时创建新的 Application 实例
-                telegram_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-                telegram_application.add_handler(CommandHandler("start", start))
-                telegram_application.add_handler(CommandHandler("set", set_api_key))
-                telegram_application.add_handler(CommandHandler("block", block_user))         # 添加 /block 命令
-                telegram_application.add_handler(CommandHandler("unblock", unblock_user))     # 添加 /unblock 命令
-                telegram_application.add_handler(CommandHandler("clean", clean_conversations))  # 添加 /clean 命令
-                telegram_application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-                telegram_application.add_error_handler(error_handler)
 
-            async with telegram_application:
-                if not telegram_application.running: # 如果 Application 没有运行，则启动
-                    await telegram_application.start()
-                    await telegram_application.updater.start_polling()
-                    print("Bot started or re-started.")
-                    asyncio.create_task(check_telegram_connection(telegram_application)) # 启动心跳检测
-                    asyncio.create_task(process_message_queue(telegram_application)) # 启动消息队列处理
-                    is_connected = True # 设置连接状态
+    try:
+        if telegram_application is None:  # 首次或重连时创建新的 Application 实例
+            telegram_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            telegram_application.add_handler(CommandHandler("start", start))
+            telegram_application.add_handler(CommandHandler("set", set_api_key))
+            telegram_application.add_handler(CommandHandler("block", block_user))  # 添加 /block 命令
+            telegram_application.add_handler(CommandHandler("unblock", unblock_user))  # 添加 /unblock 命令
+            telegram_application.add_handler(CommandHandler("clean", clean_conversations))  # 添加 /clean 命令
+            telegram_application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+            telegram_application.add_error_handler(error_handler)
 
-                await asyncio.Future()  # 持续运行，直到被外部取消
+        async with telegram_application:
+            if not telegram_application.running:  # 如果 Application 没有运行，则启动
+                await telegram_application.start()
+                await telegram_application.updater.start_polling()
+                print("Bot started or re-started.")
+                asyncio.create_task(check_telegram_connection(telegram_application))  # 启动心跳检测
+                asyncio.create_task(process_message_queue(telegram_application))  # 启动消息队列处理
+                is_connected = True  # 设置连接状态
 
-        except (NetworkError, TimedOut) as e:
-            print(f"Telegram 连接错误: {e}")
-            print("尝试重新连接...")
-            is_connected = False  # 更新连接状态
-            if telegram_application and telegram_application.running:
-                await telegram_application.updater.stop() # 停止 updater
-                await telegram_application.stop() # 停止 application
-            telegram_application = None # 移除旧的 Application 实例，下次循环会重新创建
-            await asyncio.sleep(60)  # 等待 60 秒后重试
+            await asyncio.Future()  # 持续运行，直到被外部取消
 
-        except asyncio.CancelledError:
-            print("Stopping the bot...")
-            if telegram_application:
-                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users) # 退出前保存数据
-                if telegram_application.running:
-                    await telegram_application.updater.stop()
-                    await telegram_application.stop()
-            break
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            is_connected = False
-            if telegram_application:
-                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
-                if telegram_application.running:
-                    await telegram_application.updater.stop()
-                    await telegram_application.stop()
-            telegram_application = None # 移除旧的 Application 实例，下次循环会重新创建
-            await asyncio.sleep(60) # 等待 60 秒后重试
+    except asyncio.CancelledError:
+        print("Stopping the bot...")
+        if telegram_application:
+            save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)  # 退出前保存数据
+            if telegram_application.running:
+                await telegram_application.updater.stop()
+                await telegram_application.stop()
+    except Exception as e:
+        print(f"Unexpected error: {e}, Program will not restart automatically.")
+        is_connected = False
+        if telegram_application:
+          save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+          if telegram_application.running:
+            await telegram_application.updater.stop()
+            await telegram_application.stop()
+
 
 
 async def main() -> None:
@@ -598,6 +621,7 @@ async def main() -> None:
         print("请设置 DIFY_API_URL")
         return
     await connect_telegram()
+
 
 
 if __name__ == "__main__":
