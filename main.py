@@ -13,13 +13,17 @@ import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 
 # --- 配置部分 ---
-TELEGRAM_BOT_TOKEN = "7qNQ2ixBPI"  # 替换为你的 Telegram Bot Token
-DIFY_API_URL = "http://192.168.242.240/v1"  # 替换为你的 Dify API URL
+TELEGRAM_BOT_TOKEN = "7598117688:AAFbNGMGKqNQUWRd-2ixKDMhl4BBSHuNGPI"  # 替换为你的 Telegram Bot Token
+DIFY_API_URL = "http://192.168.212.150/v1"  # 替换为你的 Dify API URL
 HTTP_PROXY = "http://127.0.0.1:10808"  # 替换为你的代理（如果需要）  # 未使用，但保留
-ADMIN_IDS = ["1003"]  # 替换为你的管理员 ID，可以有多个
+ADMIN_IDS = ["1086477603"]  # 替换为你的管理员 ID，可以有多个
 API_KEYS = {
-    "dave": "apiarxV0",
-    "dean": "apTR3g587g",
+    "dave": "app-WAxYlivpOXw4YRjRugearxV0",
+    "dean": "app-o7mFNf4t7p493EsETR3g587g",
+    "tyson": "app-Kw3ijHYu2z2160qZPD2hDjQU",
+    "sal": "app-lGsD7shzClZit1GQbrJYFSVH",
+    "orlando": "app-5pg7iBfbA6OCr8WPZp5Tb2IG",
+    "leo": "app-Wo6lk6R6UdRNMZK0l7FOimcK",
 }
 
 DEFAULT_API_KEY_ALIAS = "dave"
@@ -235,7 +239,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                 print(f"Waiting for {delay:.2f}s")
                                 await asyncio.sleep(delay)  # 控制消息发送间隔
                     else:
-                        await bot.send_message(chat_id=chat_id, text="哎呀，没听清，能再说一遍吗？")  # 更自然的空回复
+                        await bot.send_message(chat_id=chat_id, text="呜呜，今天的流量已经用光了，刚充话费，到账需要时间，过一段时间再聊吧~")  # 更自然的空回复
                     return
 
                 elif response.status_code == 404:
