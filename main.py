@@ -28,7 +28,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 # --- 配置部分 ---
 TELEGRAM_BOT_TOKEN = "7522JHCMFjJY"  # 替换为你的 Telegram Bot Token
 DIFY_API_URL = "http://192.1"  # 替换为你的 Dify API URL
-HTTP_PROXY = "http://127.0.0.1:10808"  # 替换为你的代理（如果需要）  # 未使用，但保留
 ADMIN_IDS = ["603"]  # 替换为你的管理员 ID，可以有多个
 API_KEYS = {
     "dave": "a",
