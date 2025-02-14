@@ -1,15 +1,3 @@
+httpx==0.27.0
 python-telegram-bot==20.8
-httpx>=0.27.0,<1.0.0  # httpx版本范围更精确
-typing-extensions>=4.0.0,<5.0.0 # python-telegram-bot的间接依赖，明确版本范围
-certifi>=2024.2.2  # httpx的依赖，用于HTTPS请求的证书验证, 通常不需要指定，但为了环境一致性可以考虑加入
-
-# 以下是代码中用到的标准库，不需要在requirements.txt中列出
-# json
-# os
-# asyncio
-# uuid
-# re
-# time
-# random
-# base64
-# pickle
+aiosqlite==0.20.0
