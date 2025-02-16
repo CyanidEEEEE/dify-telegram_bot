@@ -1,6 +1,17 @@
 import json
 import os
 import re
+import sys
+
+def get_script_dir():
+    """获取脚本或 EXE 文件所在的目录。"""
+    if getattr(sys, 'frozen', False):  # 检查是否是打包后的 EXE
+        # 打包后的 EXE
+        application_path = sys.executable
+        return os.path.dirname(application_path)
+    else:
+        # 正常 Python 脚本
+        return os.path.dirname(os.path.abspath(__file__))
 
 def convert_to_txt(output_txt_path, bot_name="FVN_Chat"):
     """
@@ -12,7 +23,7 @@ def convert_to_txt(output_txt_path, bot_name="FVN_Chat"):
         bot_name (str): 机器人的名字, 默认为 "FVN_Chat".
     """
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
+    current_dir = get_script_dir()  # 使用 get_script_dir() 函数
     json_file_path = os.path.join(current_dir, 'result.json')
 
     try:
@@ -27,6 +38,7 @@ def convert_to_txt(output_txt_path, bot_name="FVN_Chat"):
         last_speaker = None
 
         for message in data.get('messages', []):
+            # ... (其余代码与之前相同) ...
             if message.get('type') == 'message':
                 text_content = message.get('text', '')
 
@@ -124,6 +136,7 @@ def convert_to_txt(output_txt_path, bot_name="FVN_Chat"):
                     f.write(f"{speaker}: {text}")
                     last_speaker = speaker
         f.write("\n") # 保持末尾换行
+        
 
 if __name__ == "__main__":
     output_txt_path = 'conversation_history.txt'
