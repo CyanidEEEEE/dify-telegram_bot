@@ -163,9 +163,15 @@ def get_user_api_key(user_id: str):
 async def set_api_key(update: telegram.Update, context: CallbackContext):
     """设置用户使用的 Dify API Key。"""
     user_id = str(update.effective_user.id)
+    
+    # 获取所有可用角色列表
+    available_roles = list(api_keys.keys())
+    role_list = "\n".join([f"• {role}" for role in available_roles])
+    
     if not context.args:
-        await update.message.reply_text("想换个人聊天？告诉我它的名字，比如：/set dave")
+        await update.message.reply_text(f"想换个人聊天吗？我可以帮你摇人，我认识这些家伙：\n{role_list}\n")
         return
+        
     alias = context.args[0].lower()
     if alias in api_keys:
         old_alias = user_api_keys.get(user_id)
@@ -175,7 +181,7 @@ async def set_api_key(update: telegram.Update, context: CallbackContext):
         save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
         await update.message.reply_text(f"好嘞，让 {alias} 来跟你聊吧！")
     else:
-        await update.message.reply_text(f"呃，我不认识叫 '{alias}' 的家伙。")
+        await update.message.reply_text(f"呃，我不认识叫 '{alias}' 的家伙，我可以帮你摇人，但是我只认识这些家伙：\n{role_list}\n")
 
 
 def segment_text(text, segment_regex):
@@ -367,7 +373,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                     delayed_memory_tasks[conversation_key] = None
                                     await bot.send_message(
                                         chat_id=chat_id,
-                                        text="检测到配额限制，如果你选择保存记忆，系统会在5分钟后处理。"
+                                        text="抱歉啦，我现在有点累了，需要休息一下~不过别担心，你想继续的话，我5分钟后再来找你哦！"
                                     )
                                     await offer_save_memory(bot, chat_id, conversation_key)
                                     return
@@ -445,7 +451,7 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                     delayed_memory_tasks[conversation_key] = None
                     await bot.send_message(
                         chat_id=chat_id,
-                        text="检测到配额限制，如果你选择保存记忆，系统会在5分钟后处理。"
+                        text="抱歉啦，我现在有点累了，需要休息一下~不过别担心，你想继续的话，我5分钟后再来找你哦！"
                     )
                     await offer_save_memory(bot, chat_id, conversation_key)
                 except Exception as e:
@@ -482,7 +488,7 @@ async def offer_save_memory(bot, chat_id, conversation_key):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await bot.send_message(
         chat_id=chat_id,
-        text="对话出现异常，是否保存当前记忆？",
+        text="对方似乎有点忙，是否继续对话？感觉如果不继续的话对方很快就会把你忘了。",
         reply_markup=reply_markup
     )
 
@@ -505,7 +511,7 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
     # 检查文件类型
     if message.document:
         if message.document.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
-            await bot.send_message(chat_id=chat_id, text="这个文件我打不开呀，抱歉啦。")  # 更自然的拒绝
+            await bot.send_message(chat_id=chat_id, text="这个文件我打不开呀，抱歉啦~")  # 更自然的拒绝
             return
 
     # 确定消息类型和内容
@@ -515,7 +521,7 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
 
     # 直接处理不支持的消息类型
     if message.sticker:
-        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏")  # 更自然的表情回复
+        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏~")  # 更自然的表情回复
         return
     
     # 处理支持的消息类型
@@ -621,7 +627,7 @@ async def process_message_queue(application: Application):
             
             for update, context, message_type, message_content, file_info in current_user_queue:
                 if message_type == "sticker":
-                    await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏")  # 更自然的表情回复
+                    await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏~")  # 更自然的表情回复
                 elif message_type == "text":
                     collected_text += (message_content if message_content else "") + "\n"
                 elif message_type in ("photo", "voice", "document"):
@@ -966,9 +972,8 @@ async def button_callback(update: telegram.Update, context: ContextTypes.DEFAULT
                     if conversation_key in delayed_memory_tasks:
                         print(f"用户 {user_id} 的记忆将在5分钟后保存（由于配额限制）")
                         await query.edit_message_text(
-                            "由于配额限制，系统将在5分钟后处理记忆保存。\n"
-                            "你可以先去做别的事，系统会自动处理。\n"
-                            "处理完成后对话会自动继续。"
+                            "我需要休息一小会儿，5分钟后再来找你！\n"
+                            "你先去忙别的吧，我们之后再聊~"
                         )
                         # 创建延迟任务
                         async def delayed_save():
@@ -996,13 +1001,13 @@ async def button_callback(update: telegram.Update, context: ContextTypes.DEFAULT
                                     print(f"记忆导入成功 - 用户: {user_id}")
                                     await context.bot.send_message(
                                         chat_id=user_id,
-                                        text="✅ 记忆已成功保存并导入！\n现在你可以继续新的对话了。"
+                                        text="来了来了，我们继续吧~"
                                     )
                                 except Exception as e:
                                     print(f"记忆导入时出错 - 用户: {user_id}, 错误: {e}")
                                     await context.bot.send_message(
                                         chat_id=user_id,
-                                        text="记忆已保存，但导入时出现错误，请稍后重试。"
+                                        text="哎呀，事情还是没做完，要不你再等等，让我再试试？"
                                     )
                                 finally:
                                     is_importing_memory = False
@@ -1011,7 +1016,7 @@ async def button_callback(update: telegram.Update, context: ContextTypes.DEFAULT
                                 print(f"延迟保存记忆时出错 - 用户: {user_id}, 错误: {e}")
                                 await context.bot.send_message(
                                     chat_id=user_id,
-                                    text="❌ 保存记忆时出现错误，请稍后重试。"
+                                    text="哎呀，事情还是没做完，要不你再等等，让我再试试？"
                                 )
                             finally:
                                 print(f"延迟保存任务完成 - 用户: {user_id}")
@@ -1024,13 +1029,14 @@ async def button_callback(update: telegram.Update, context: ContextTypes.DEFAULT
                     else:
                         # 正常保存流程
                         await save_memory(user_id, conversation_id, chat_content, current_api_key_alias)
-                        await query.edit_message_text("✅ 记忆已保存！\n现在你可以继续新的对话了。")
+                        await query.edit_message_text("我需要休息一小会儿，5分钟后再来找你！\n"
+                                                      "你先去忙别的吧，我们之后再聊~")
                         user_importing_memory[user_id] = False
                 else:
-                    await query.edit_message_text("没有找到可以保存的有效对话历史。")
+                    await query.edit_message_text("咦，你好像没和我说过话呢...")
                     user_importing_memory[user_id] = False
             else:
-                await query.edit_message_text("没有找到可以保存的对话历史。")
+                await query.edit_message_text("咦，你好像没和我说过话呢...")
                 user_importing_memory[user_id] = False
             
         elif query.data == "new_conversation":
