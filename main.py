@@ -41,7 +41,7 @@ DEFAULT_API_KEY_ALIAS = "dave"
 
 # --- 代码部分 ---
 message_queue = asyncio.Queue()
-rate_limit = 25  # 基础速率限制（秒）
+rate_limit = 15  # 基础速率限制（秒）
 user_last_processed_time = {}
 segment_regex = r'[^。！？!?\.…]+[。！？!?\.…]+|[^。！？!?\.…]+$'
 
@@ -513,28 +513,31 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
     message_content = None
     file_info = None
 
+    # 直接处理不支持的消息类型
+    if message.sticker:
+        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏")  # 更自然的表情回复
+        return
+    
+    # 处理支持的消息类型
     if message.text:
         message_type = "text"
         message_content = message.text
     elif message.photo:
         message_type = "photo"
-        message_content = message.caption if message.caption else "看看这张图片"  # 图片可以有标题
+        message_content = message.caption if message.caption else "看看这张图片"
         file_info = {"file_id": message.photo[-1].file_id, "file_type": "image", "file_name": f"photo_{uuid.uuid4()}.jpg",
                      "mime_type": "image/jpeg"}
     elif message.voice:
         message_type = "voice"
-        message_content = message.caption if message.caption else "语音消息"  # 语音也可以有标题
+        message_content = message.caption if message.caption else "语音消息"
         file_info = {"file_id": message.voice.file_id, "file_type": "audio", "file_name": f"voice_{uuid.uuid4()}.ogg",
                      "mime_type": "audio/ogg"}
     elif message.document:
         message_type = "document"
-        message_content = message.caption if message.caption else "看看这个文件"  # 文件也可以有标题
+        message_content = message.caption if message.caption else "看看这个文件"
         file_info = {"file_id": message.document.file_id, "file_type": "document",
                      "file_name": message.document.file_name or f"document_{uuid.uuid4()}",
                      "mime_type": message.document.mime_type}
-    elif message.sticker:
-        message_type = "sticker"
-        message_content = "用户发送了一个表情"  # sticker 没有 caption
 
     # 将消息加入队列
     await message_queue.put((update, context, message_type, message_content, file_info))
