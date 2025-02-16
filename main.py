@@ -41,7 +41,7 @@ DEFAULT_API_KEY_ALIAS = "dave"
 
 # --- 代码部分 ---
 message_queue = asyncio.Queue()
-rate_limit = 30  # 基础速率限制（秒）
+rate_limit = 25  # 基础速率限制（秒）
 user_last_processed_time = {}
 segment_regex = r'[^。！？!?\.…]+[。！？!?\.…]+|[^。！？!?\.…]+$'
 
@@ -559,15 +559,6 @@ async def process_message_queue(application: Application):
                 await asyncio.sleep(1)
                 continue
 
-            # 速率限制
-            message_arrival_time = time.time()
-            last_processed_time = user_last_processed_time.get(user_id, 0)
-
-            if message_arrival_time - last_processed_time < rate_limit:
-                remaining_time = rate_limit - (message_arrival_time - last_processed_time)
-                print(f"用户 {user_id} 触发基本速率限制, 剩余等待时间: {remaining_time:.2f} 秒")
-                await asyncio.sleep(remaining_time)
-
             # 检查是否是记忆操作
             if message_type == "memory_operation":
                 # 获取用户的 API key 信息
@@ -660,7 +651,6 @@ async def process_message_queue(application: Application):
                     await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
             except TimedOut as e:
                 print(f"Error in process_message_queue during dify_stream_response: {e}")
-                # 将消息重新放回队列
                 await message_queue.put((update, context, message_type, message_content, file_info))
             except Exception as e:
                 print(f"Error in process_message_queue during dify_stream_response: {e}")
@@ -669,8 +659,8 @@ async def process_message_queue(application: Application):
                 except:
                     pass
 
-            # 6. 更新最后处理时间
-            user_last_processed_time[user_id] = time.time()
+            # 处理完消息后等待 rate_limit 秒
+            await asyncio.sleep(rate_limit)
             
             # 只在处理完所有消息后调用一次 task_done
             for _ in range(len(current_user_queue)):
