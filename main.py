@@ -41,7 +41,7 @@ DEFAULT_API_KEY_ALIAS = "dave"
 
 # --- 代码部分 ---
 message_queue = asyncio.Queue()
-rate_limit = 15  # 基础速率限制（秒）
+rate_limit = 25  # 基础速率限制（秒）
 user_last_processed_time = {}
 segment_regex = r'[^。！？!?\.…]+[。！？!?\.…]+|[^。！？!?\.…]+$'
 
