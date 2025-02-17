@@ -39,8 +39,14 @@ API_KEYS = {
 DEFAULT_API_KEY_ALIAS = "dave"
 
 
+MEMORY_CONFIG = {
+    'max_history_length': 200,  # 历史记录限制
+    'max_queue_size': 200,     # 消息队列大小限制
+    'max_file_size': 10 * 1024 * 1024  # 文件大小限制(10MB)
+}
+
 # --- 代码部分 ---
-message_queue = asyncio.Queue()
+message_queue = asyncio.Queue(maxsize=MEMORY_CONFIG['max_queue_size'])
 rate_limit = 25  # 基础速率限制（秒）
 user_last_processed_time = {}
 segment_regex = r'[^。！？!?\.…]+[。！？!?\.…]+|[^。！？!?\.…]+$'
@@ -241,6 +247,11 @@ def segment_text(text, segment_regex):
 
 async def upload_file_to_dify(file_bytes, file_name, mime_type, user_id):
     """上传文件到 Dify。"""
+    # 添加文件大小检查
+    if len(file_bytes) > MEMORY_CONFIG['max_file_size']:
+        print(f"文件过大: {len(file_bytes)} bytes")
+        return None
+        
     current_api_key, _ = get_user_api_key(user_id)
     headers = {"Authorization": f"Bearer {current_api_key}"}
     files = {'file': (file_name, file_bytes, mime_type), 'user': (None, str(user_id))}
@@ -298,12 +309,13 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
     if history_key not in conversation_history:
         conversation_history[history_key] = []
     
-    # 检查历史记录长度，如果超过限制则保留最新的部分
-    max_history_length = 1000  # 设置一个合理的历史记录长度限制
+    # 使用更小的历史记录限制
+    max_history_length = MEMORY_CONFIG['max_history_length']
     if len(conversation_history[history_key]) > max_history_length:
-        # 保留最新的记录
+        # 保留最新的记录，但在清理时释放内存
         conversation_history[history_key] = conversation_history[history_key][-max_history_length:]
-        print(f"历史记录超出限制，已截取最新的 {max_history_length} 条记录")
+        # 强制垃圾回收
+        gc.collect()
     
     # 只有在不是导入记忆时才记录用户消息
     if not is_importing_memory:
@@ -477,6 +489,20 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
         await offer_save_memory(bot, chat_id, conversation_key)
         return
 
+    # 添加文件大小检查
+    if files:
+        total_file_size = 0
+        for file_info in files:
+            if isinstance(file_info, dict) and 'size' in file_info:
+                total_file_size += file_info['size']
+        if total_file_size > MEMORY_CONFIG['max_file_size']:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="文件总大小超过限制，请分开发送或压缩后重试"
+            )
+            return
+
+
 async def offer_save_memory(bot, chat_id, conversation_key):
     """提供保存记忆的选项"""
     keyboard = [
@@ -510,9 +536,21 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
 
     # 检查文件类型
     if message.document:
-        if message.document.mime_type not in SUPPORTED_DOCUMENT_MIME_TYPES:
-            await bot.send_message(chat_id=chat_id, text="这个文件我打不开呀，抱歉啦~")  # 更自然的拒绝
+        # 添加文件大小检查
+        if message.document.file_size > MEMORY_CONFIG['max_file_size']:
+            await bot.send_message(
+                chat_id=chat_id, 
+                text="文件太大啦，能不能发个小一点的？(最大10MB)"
+            )
             return
+
+    # 检查队列大小
+    if message_queue.qsize() >= MEMORY_CONFIG['max_queue_size'] * 0.9:  # 90%阈值
+        await bot.send_message(
+            chat_id=chat_id,
+            text="我现在有点忙，请稍后再发消息~"
+        )
+        return
 
     # 确定消息类型和内容
     message_type = "unknown"
@@ -788,90 +826,136 @@ async def clean_conversations(update: telegram.Update, context: CallbackContext)
         )
 
 
-async def check_telegram_connection(application: Application):
-    """检查 Telegram 连接状态"""
-    global is_connected
-    while True:
-        try:
-            # 修改代理配置格式
-            async with httpx.AsyncClient(
-                proxy=TELEGRAM_PROXY['url'],  # 直接使用 proxy 参数
-                timeout=30.0
-            ) as client:
-                await application.bot.get_me()
-                
-            if not is_connected:
-                print("Telegram connection restored.")
-                is_connected = True
-                user_last_processed_time.clear()
-                
-        except Exception as e:
-            if is_connected:
-                print(f"Telegram connection lost: {e}")
-                is_connected = False
-            else:
-                print(f"Telegram connection check error: {e}")
+# 修改连接监控器类
+class TelegramConnectionMonitor:
+    def __init__(self, application: Application):
+        self.application = application
+        self.is_healthy = True
+        self.last_heartbeat = time.time()
+        self.consecutive_failures = 0
+        self.max_failures = 3
+        self._monitor_task = None
+        self._reconnect_lock = asyncio.Lock()  # 添加重连锁
         
-        await asyncio.sleep(5)
-
-
-async def load_memories():
-    """从数据库加载所有保存的记忆"""
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            'SELECT user_id, conversation_id, api_key_alias, chat_content FROM chat_memories'
-        ) as cursor:
-            memories = await cursor.fetchall()
-            for user_id, conversation_id, api_key_alias, chat_content in memories:
-                # 使用组合键存储记忆
-                history_key = (user_id, api_key_alias)
-                conversation_key = (user_id, api_key_alias)
-                
-                # 恢复对话历史
-                conversation_history[history_key] = chat_content.split('\n')
-                # 恢复对话ID
-                conversation_ids_by_user[conversation_key] = conversation_id
-
-
-async def init_db():
-    """初始化数据库表并加载记忆"""
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS chat_memories (
-                user_id TEXT,
-                conversation_id TEXT,
-                api_key_alias TEXT,
-                chat_content TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, conversation_id, api_key_alias)
-            )
-        ''')
-        await db.commit()
-    
-    # 加载保存的记忆
-    await load_memories()
+    async def start_monitoring(self):
+        """启动连接监控"""
+        self._monitor_task = asyncio.create_task(self._run_health_check())
+        
+    async def stop_monitoring(self):
+        """停止连接监控"""
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
+            
+    async def _run_health_check(self):
+        """运行健康检查"""
+        while True:
+            try:
+                async with httpx.AsyncClient(
+                    proxy=TELEGRAM_PROXY['url'],
+                    timeout=30.0,
+                    verify=False  # 添加此选项以避免某些SSL问题
+                ) as client:
+                    await self.application.bot.get_me()
+                    
+                self.last_heartbeat = time.time()
+                if not self.is_healthy:
+                    print("Connection health restored")
+                    self.is_healthy = True
+                    self.consecutive_failures = 0
+                    # 网络恢复时主动触发重连
+                    asyncio.create_task(self._trigger_reconnect())
+                    
+            except Exception as e:
+                self.consecutive_failures += 1
+                if self.is_healthy and self.consecutive_failures >= self.max_failures:
+                    print(f"Connection health check failed {self.consecutive_failures} times: {e}")
+                    self.is_healthy = False
+                    # 触发重连
+                    asyncio.create_task(self._trigger_reconnect())
+                    
+            await asyncio.sleep(30)  # 每30秒检查一次
+            
+    async def _trigger_reconnect(self):
+        """触发重连流程"""
+        global is_connected
+        # 使用锁确保同一时间只有一个重连流程
+        async with self._reconnect_lock:
+            try:
+                if not self.is_healthy or not is_connected:
+                    is_connected = False
+                    print("Triggering reconnection...")
+                    # 保存状态
+                    save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                    
+                    # 停止当前应用
+                    if self.application.running:
+                        try:
+                            await self.application.updater.stop()
+                            await self.application.stop()
+                            print("Application stopped successfully")
+                        except Exception as e:
+                            print(f"Error stopping application: {e}")
+                    
+                    # 等待一段时间后重新初始化应用
+                    await asyncio.sleep(5)
+                    
+                    # 重新初始化应用
+                    try:
+                        await self.application.initialize()
+                        await self.application.start()
+                        await self.application.updater.start_polling(
+                            poll_interval=1.0,
+                            timeout=30,
+                            bootstrap_retries=5,
+                            read_timeout=30,
+                            write_timeout=30
+                        )
+                        print("Application restarted successfully")
+                        is_connected = True
+                        self.is_healthy = True
+                        self.consecutive_failures = 0
+                        
+                        # 重新启动消息处理队列
+                        asyncio.create_task(process_message_queue(self.application))
+                        
+                    except Exception as e:
+                        print(f"Error restarting application: {e}")
+                        # 如果重启失败,标记为不健康以便下次检查时重试
+                        self.is_healthy = False
+                        is_connected = False
+                        
+            except Exception as e:
+                print(f"Error in reconnection process: {e}")
+                self.is_healthy = False
+                is_connected = False
 
 
 async def connect_telegram():
-    """连接 Telegram 机器人。"""
+    """连接 Telegram 机器人"""
     global is_connected, telegram_application
     retry_delay = 10
     max_retry_delay = 300
+    connection_monitor = None
 
     while True:
         try:
             if telegram_application is None:
-                # 使用新的代理配置方式
                 telegram_application = (
                     Application.builder()
                     .token(TELEGRAM_BOT_TOKEN)
-                    .proxy(TELEGRAM_PROXY['url'])  # 使用 proxy 而不是 proxy_url
+                    .proxy(TELEGRAM_PROXY['url'])
                     .connect_timeout(TELEGRAM_PROXY['connect_timeout'])
                     .read_timeout(TELEGRAM_PROXY['read_timeout'])
                     .write_timeout(TELEGRAM_PROXY['write_timeout'])
                     .get_updates_read_timeout(42)
                     .build()
                 )
+                
                 # 添加处理器
                 telegram_application.add_handler(CommandHandler("start", start))
                 telegram_application.add_handler(CommandHandler("set", set_api_key))
@@ -885,25 +969,38 @@ async def connect_telegram():
 
             async with telegram_application:
                 if not telegram_application.running:
-                    # 先初始化数据库和加载记忆
+                    # 初始化数据库和加载记忆
                     await init_db()
                     
+                    # 启动应用
                     await telegram_application.start()
                     await telegram_application.updater.start_polling()
-                    print("Bot started or re-started.")
-                    # 清除所有用户的最后处理时间
+                    print("Bot started successfully")
+                    
+                    # 清除用户处理时间
                     user_last_processed_time.clear()
-                    # 启动连接检查和消息处理
-                    asyncio.create_task(check_telegram_connection(telegram_application))
+                    
+                    # 启动连接监控
+                    connection_monitor = TelegramConnectionMonitor(telegram_application)
+                    await connection_monitor.start_monitoring()
+                    
+                    # 启动消息处理
                     asyncio.create_task(process_message_queue(telegram_application))
+                    
                     is_connected = True
                     retry_delay = 10  # 重置重试延迟
 
-                await asyncio.Future()  # 持续运行，直到被外部取消
+                await asyncio.Future()  # 持续运行直到被取消
 
         except Exception as e:
             print(f"Connection error: {e}")
             is_connected = False
+            
+            # 停止连接监控
+            if connection_monitor:
+                await connection_monitor.stop_monitoring()
+                connection_monitor = None
+            
             if telegram_application:
                 try:
                     save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
@@ -914,9 +1011,9 @@ async def connect_telegram():
                     print(f"Error stopping application: {stop_error}")
                 telegram_application = None
             
+            # 指数退避重试
             print(f"Waiting {retry_delay} seconds before reconnecting...")
             await asyncio.sleep(retry_delay)
-            # 指数退避重试延迟，但不超过最大值
             retry_delay = min(retry_delay * 2, max_retry_delay)
             print("Attempting to reconnect...")
             continue
@@ -930,7 +1027,14 @@ async def main() -> None:
     if not DIFY_API_URL or DIFY_API_URL == "YOUR_DIFY_API_URL":
         print("请设置 DIFY_API_URL")
         return
-    await connect_telegram()
+    
+    # 启动清理任务
+    cleanup_task = asyncio.create_task(cleanup_old_data())
+    
+    try:
+        await connect_telegram()
+    finally:
+        cleanup_task.cancel()
 
 
 # 修改 button_callback 函数
@@ -1127,7 +1231,7 @@ async def save_memory(user_id: str, conversation_id: str, chat_content: str, api
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
-                'INSERT OR REPLACE INTO chat_memories (user_id, conversation_id, api_key_alias, chat_content) VALUES (?, ?, ?, ?)',
+                'INSERT OR REPLACE INTO chat_memories (user_id, conversation_id, api_key_alias, chat_content, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
                 (user_id, conversation_id, api_key_alias, chat_content))
             await db.commit()
             print("记忆保存成功")
@@ -1151,6 +1255,97 @@ async def get_memory(user_id: str, conversation_id: str, api_key_alias: str):
     except Exception as e:
         print(f"获取记忆时出错: {e}")
         return None
+
+
+# 修改数据库初始化函数
+async def init_db():
+    """初始化数据库，创建必要的表"""
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            # 检查表是否存在
+            async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_memories'") as cursor:
+                table_exists = await cursor.fetchone()
+                
+                if not table_exists:
+                    # 如果表不存在，创建新表
+                    await db.execute('''
+                        CREATE TABLE chat_memories (
+                            user_id TEXT,
+                            conversation_id TEXT,
+                            api_key_alias TEXT,
+                            chat_content TEXT,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (user_id, conversation_id, api_key_alias)
+                        )
+                    ''')
+                else:
+                    # 如果表存在，检查是否需要迁移
+                    async with db.execute("PRAGMA table_info(chat_memories)") as cursor:
+                        columns = await cursor.fetchall()
+                        has_created_at = any(col[1] == 'created_at' for col in columns)
+                        
+                        if not has_created_at:
+                            print("需要迁移数据库以添加 created_at 列")
+                            # 创建新表
+                            await db.execute('''
+                                CREATE TABLE chat_memories_new (
+                                    user_id TEXT,
+                                    conversation_id TEXT,
+                                    api_key_alias TEXT,
+                                    chat_content TEXT,
+                                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                    PRIMARY KEY (user_id, conversation_id, api_key_alias)
+                                )
+                            ''')
+                            
+                            # 复制旧数据
+                            await db.execute('''
+                                INSERT INTO chat_memories_new (user_id, conversation_id, api_key_alias, chat_content)
+                                SELECT user_id, conversation_id, api_key_alias, chat_content FROM chat_memories
+                            ''')
+                            
+                            # 删除旧表
+                            await db.execute('DROP TABLE chat_memories')
+                            
+                            # 重命名新表
+                            await db.execute('ALTER TABLE chat_memories_new RENAME TO chat_memories')
+                            
+                            print("数据库迁移完成")
+            
+            await db.commit()
+            print("数据库初始化成功")
+    except Exception as e:
+        print(f"数据库初始化错误: {e}")
+        raise
+
+
+# 修改清理函数
+async def cleanup_old_data():
+    """定期清理旧数据"""
+    while True:
+        try:
+            # 清理数据库中的旧记录
+            async with aiosqlite.connect(DB_FILE) as db:
+                # 删除30天前的记录
+                await db.execute('''
+                    DELETE FROM chat_memories 
+                    WHERE datetime(created_at) < datetime('now', '-30 days')
+                ''')
+                await db.commit()
+            
+            # 清理内存中的旧对话历史
+            for key in list(conversation_history.keys()):
+                if len(conversation_history[key]) > MEMORY_CONFIG['max_history_length']:
+                    conversation_history[key] = conversation_history[key][-MEMORY_CONFIG['max_history_length']:]
+            
+            # 强制垃圾回收
+            gc.collect()
+            
+        except Exception as e:
+            print(f"清理数据时出错: {e}")
+            print("将在下次循环重试")
+        
+        await asyncio.sleep(3600)  # 每小时清理一次
 
 
 if __name__ == "__main__":
