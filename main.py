@@ -21,6 +21,7 @@ import time
 import random
 import base64
 import aiosqlite
+import gc
 import pickle
 from telegram.error import NetworkError, TimedOut, TelegramError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
