@@ -91,9 +91,11 @@ delayed_memory_tasks = {}
 # 修改 TELEGRAM_PROXY 配置
 TELEGRAM_PROXY = {
     'url': 'socks5://127.0.0.1:10808',  # 使用 socks5 协议
-    'connect_timeout': 30,  # 连接超时时间（秒）
-    'read_timeout': 30,    # 读取超时时间（秒）
-    'write_timeout': 30,   # 写入超时时间（秒）
+    'connect_timeout': 60,  # 连接超时时间（秒）- 增加超时时间
+    'read_timeout': 60,     # 读取超时时间（秒）- 增加超时时间
+    'write_timeout': 60,    # 写入超时时间（秒）- 增加超时时间
+    'pool_timeout': 120,    # 连接池超时时间 - 新增
+    'pool_connections': 20  # 连接池大小 - 新增
 }
 
 # 修改 DIFY_TIMEOUT 配置
@@ -116,6 +118,12 @@ TYPING_CONFIG = {
 # 添加全局变量来跟踪消息处理队列任务
 message_queue_task = None
 
+# 在代码开头添加这些全局变量
+connection_monitor = None  # 全局变量，存储连接监控器实例
+WATCHDOG_TIMEOUT = 1800  # 看门狗超时时间（秒）- 从600秒改为1800秒（30分钟）
+last_activity_time = time.time()  # 记录最后活动时间
+last_message_queue_size = 0  # 记录上次消息队列大小，用于检测队列是否卡住
+
 def load_data():
     """加载保存的会话数据和 API 密钥。"""
     global API_KEYS, delayed_memory_tasks, conversation_history  # 添加 conversation_history
@@ -124,14 +132,20 @@ def load_data():
             data = pickle.load(f)
             conversation_ids_by_user = data.get('conversation_ids_by_user', {})
             loaded_api_keys = data.get('api_keys', {})
+            # 更新全局API_KEYS但不覆盖原始值
             API_KEYS.update(loaded_api_keys)
             user_api_keys = data.get('user_api_keys', {})
             blocked_users = data.get('blocked_users', set())
             # 加载对话历史
-            conversation_history = data.get('conversation_history', {})
+            loaded_conversation_history = data.get('conversation_history', {})
+            # 更新全局conversation_history
+            for key, value in loaded_conversation_history.items():
+                conversation_history[key] = value
             # 确保 delayed_memory_tasks 被初始化为空字典
             delayed_memory_tasks = {}
-            return conversation_ids_by_user, API_KEYS, user_api_keys, blocked_users
+            
+            print(f"已加载 {len(conversation_ids_by_user)} 个对话ID, {len(loaded_conversation_history)} 个对话历史记录")
+            return conversation_ids_by_user, loaded_api_keys, user_api_keys, blocked_users
     except (FileNotFoundError, EOFError, pickle.UnpicklingError) as e:
         print(f"Error loading data from {DATA_FILE}: {e}, using default values.")
         conversation_history = {}  # 初始化对话历史
@@ -302,11 +316,14 @@ async def send_message_naturally(bot, chat_id, text):
 
 async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bot, files=None) -> None:
     """向 Dify 发送消息并处理流式响应。"""
-    global conversation_history, is_importing_memory
+    global conversation_history, is_importing_memory, last_activity_time
     user_id = str(chat_id)
     current_api_key, current_api_key_alias = get_user_api_key(user_id)
     history_key = (user_id, current_api_key_alias)
     conversation_key = (user_id, current_api_key_alias)
+
+    # 更新活动时间
+    last_activity_time = time.time()
 
     # 初始化对话历史
     if history_key not in conversation_history:
@@ -337,6 +354,11 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
         print(f"Continuing conversation: {chat_id=}, {conversation_id=}, role={current_api_key_alias}")
     else:
         print(f"Starting new conversation: {chat_id=}, role={current_api_key_alias}")
+        # 记录没有找到现有会话ID的情况
+        if conversation_key in conversation_ids_by_user:
+            print(f"警告: 对话键 {conversation_key} 在字典中但值为: {conversation_ids_by_user.get(conversation_key)}")
+        else:
+            print(f"信息: 对话键 {conversation_key} 不在字典中")
 
     full_text_response = ""
     typing_message = None
@@ -411,9 +433,10 @@ async def dify_stream_response(user_message: str, chat_id: int, bot: telegram.Bo
                                 response_conversation_id = response_data.get("conversation_id")
                                 if response_conversation_id:
                                     # 使用组合键保存对话ID
+                                    old_id = conversation_ids_by_user.get(conversation_key, "无")
                                     conversation_ids_by_user[conversation_key] = response_conversation_id
                                     save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
-                                    print(f"Stored/Updated conversation_id: {response_conversation_id} for user: {user_id}, role: {current_api_key_alias}")
+                                    print(f"Stored/Updated conversation_id: {response_conversation_id} for user: {user_id}, role: {current_api_key_alias} (旧ID: {old_id})")
                                 else:
                                     print("Warning: conversation_id not found in the first chunk!")
 
@@ -594,127 +617,226 @@ async def handle_message(update: telegram.Update, context: ContextTypes.DEFAULT_
 
 async def process_message_queue(application: Application):
     """处理消息队列中的消息。"""
+    global last_activity_time, connection_monitor
     print("process_message_queue started")
+    
+    # 添加处理状态跟踪
+    last_successful_process = time.time()
+    processing_timeout = 300  # 5分钟无成功处理视为卡住
+    
     while True:
         try:
-            # 1. 从队列中获取一个消息
-            update, context, message_type, message_content, file_info = await message_queue.get()
+            # 检查是否长时间无处理成功
+            current_time = time.time()
+            if current_time - last_successful_process > processing_timeout:
+                print(f"消息处理循环已 {current_time - last_successful_process:.1f} 秒未成功处理消息，可能已卡住")
+                # 重置状态
+                print("尝试重置消息处理状态...")
+                last_successful_process = current_time  # 重置计时器，避免连续报警
+                
+                # 如果队列不为空但处理停滞，可能是卡在了某个消息上
+                if not message_queue.empty():
+                    queue_size = message_queue.qsize()
+                    print(f"消息队列中有 {queue_size} 条消息等待处理，但处理停滞")
+                    
+                    # 尝试取一条消息，如果超时则继续循环
+                    try:
+                        async with asyncio.timeout(10):  # 10秒超时
+                            update, context, message_type, message_content, file_info = await message_queue.get()
+                            print(f"成功获取一条停滞的消息: 类型 {message_type}")
+                    except asyncio.TimeoutError:
+                        print("获取消息超时，跳过当前尝试")
+                        continue
+                    except Exception as e:
+                        print(f"获取停滞消息时错误: {e}")
+                        continue
+                else:
+                    print("消息队列为空，等待新消息")
+                    # 更新活动时间，避免看门狗误判
+                    last_activity_time = current_time
+                    continue
+            
+            # 正常从队列中获取一个消息，设置超时以避免永久阻塞
+            try:
+                async with asyncio.timeout(60):  # 60秒超时
+                    print("等待从队列获取消息...")
+                    update, context, message_type, message_content, file_info = await message_queue.get()
+                    print(f"获取到消息: 类型: {message_type}, 来自用户: {update.effective_user.id}")
+            except asyncio.TimeoutError:
+                print("等待消息超时，继续循环")
+                # 更新活动时间，避免看门狗误判
+                last_activity_time = time.time()
+                continue
+            
             user_id = str(update.effective_user.id)
             chat_id = update.effective_chat.id
             bot = context.bot
 
-            # 检查是否是记忆操作
-            if message_type == "memory_operation":
-                # 获取用户的 API key 信息
-                current_api_key, current_api_key_alias = get_user_api_key(user_id)
-                conversation_key = (user_id, current_api_key_alias)
-
-                # 清除当前对话ID，以开始新对话
-                if conversation_key in conversation_ids_by_user:
-                    del conversation_ids_by_user[conversation_key]
-                    save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
-
-                # 设置导入状态
-                global is_importing_memory
-                is_importing_memory = True
-
-                try:
-                    # 处理记忆操作
-                    await dify_stream_response(message_content, chat_id, bot)
-                except Exception as e:
-                    print(f"处理记忆操作时出错: {e}")
-                    await bot.send_message(chat_id=chat_id, text="处理记忆时出现错误，请稍后重试。")
-                finally:
-                    is_importing_memory = False
-
-                message_queue.task_done()
-                continue
-
-            # 如果不是记忆操作，则进行正常的消息合并处理
-            current_user_queue = [(update, context, message_type, message_content, file_info)]
-
-            # 收集队列中该用户的其他普通消息
-            other_messages = []
-
-            while not message_queue.empty():
-                try:
-                    next_message = message_queue.get_nowait()
-                    next_update = next_message[0]
-                    next_user_id = str(next_update.effective_user.id)
-                    next_type = next_message[2]  # 获取消息类型
-
-                    if next_user_id == user_id and next_type != "memory_operation":
-                        # 只合并非记忆操作的消息
-                        current_user_queue.append(next_message)
-                    else:
-                        # 其他用户的消息或记忆操作都放回队列
-                        other_messages.append(next_message)
-                except asyncio.QueueEmpty:
-                    break
-
-            # 将其他消息放回队列
-            for other_message in other_messages:
-                await message_queue.put(other_message)
-
-            # 处理合并的消息
-            collected_text = ""
-            collected_files = []
-
-            for update, context, message_type, message_content, file_info in current_user_queue:
-                if message_type == "sticker":
-                    await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏~")  # 更自然的表情回复
-                elif message_type == "text":
-                    collected_text += (message_content if message_content else "") + "\n"
-                elif message_type in ("photo", "voice", "document"):
-                    if message_content:
-                        collected_text += message_content + "\n"
-                    try:
-                        if message_type == "photo":
-                            file = await bot.get_file(file_info['file_id'])
-                            file_bytes = await file.download_as_bytearray()
-                            file_info['file_name'] = f"photo_{uuid.uuid4()}.jpg"
-                        elif message_type == "voice":
-                            file = await bot.get_file(file_info['file_id'])
-                            file_bytes = await file.download_as_bytearray()
-                        elif message_type == "document":
-                            file = await bot.get_file(file_info['file_id'])
-                            file_bytes = await file.download_as_bytearray()
-                        upload_result = await upload_file_to_dify(bytes(file_bytes), file_info['file_name'],
-                                                                file_info['mime_type'], user_id)
-                        if upload_result and upload_result.get("id"):
-                            collected_files.append({"type": file_info['file_type'], "transfer_method": "local_file",
-                                                    "upload_file_id": upload_result["id"]})
-                    except Exception as e:
-                        print(f"文件上传/处理错误: {e}")
-                        await bot.send_message(chat_id=chat_id, text="处理文件的时候出了点小问题...")
-
-            # 5. 发送合并后的消息
+            # 更新活动时间 - 从队列获取消息也是一种活动
+            last_activity_time = time.time()
+            
             try:
-                if collected_text.strip() or collected_files:
-                    print(f"合并消息: {collected_text}, 文件: {collected_files}")
-                    await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
-            except TimedOut as e:
-                print(f"Error in process_message_queue during dify_stream_response: {e}")
-                await message_queue.put((update, context, message_type, message_content, file_info))
-            except Exception as e:
-                print(f"Error in process_message_queue during dify_stream_response: {e}")
+                # 更新连接监控器的最后消息处理时间
+                if connection_monitor:
+                    connection_monitor.last_message_processed_time = time.time()
+                    connection_monitor.last_heartbeat = time.time()  # 也更新心跳时间
+                    
+                # 检查是否是记忆操作
+                if message_type == "memory_operation":
+                    # 获取用户的 API key 信息
+                    current_api_key, current_api_key_alias = get_user_api_key(user_id)
+                    conversation_key = (user_id, current_api_key_alias)
+
+                    # 清除当前对话ID，以开始新对话
+                    if conversation_key in conversation_ids_by_user:
+                        del conversation_ids_by_user[conversation_key]
+                        save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+
+                    # 设置导入状态
+                    global is_importing_memory
+                    is_importing_memory = True
+
+                    try:
+                        # 处理记忆操作
+                        await dify_stream_response(message_content, chat_id, bot)
+                    except Exception as e:
+                        print(f"处理记忆操作时出错: {e}")
+                        await bot.send_message(chat_id=chat_id, text="处理记忆时出现错误，请稍后重试。")
+                    finally:
+                        is_importing_memory = False
+
+                    message_queue.task_done()
+                    # 更新成功处理时间
+                    last_successful_process = time.time()
+                    continue
+
+                # 如果不是记忆操作，则进行正常的消息合并处理
+                current_user_queue = [(update, context, message_type, message_content, file_info)]
+                
+                # 收集队列中该用户的其他普通消息
+                other_messages = []
+
+                while not message_queue.empty():
+                    try:
+                        next_message = message_queue.get_nowait()
+                        next_update = next_message[0]
+                        next_user_id = str(next_update.effective_user.id)
+                        next_type = next_message[2]  # 获取消息类型
+
+                        if next_user_id == user_id and next_type != "memory_operation":
+                            # 只合并非记忆操作的消息
+                            current_user_queue.append(next_message)
+                        else:
+                            # 其他用户的消息或记忆操作都放回队列
+                            other_messages.append(next_message)
+                    except asyncio.QueueEmpty:
+                        break
+
+                # 将其他消息放回队列
+                for other_message in other_messages:
+                    await message_queue.put(other_message)
+
+                # 处理合并的消息
+                collected_text = ""
+                collected_files = []
+
+                for update, context, message_type, message_content, file_info in current_user_queue:
+                    if message_type == "sticker":
+                        await bot.send_message(chat_id=chat_id, text="看不懂你发的啥捏~")  # 更自然的表情回复
+                    elif message_type == "text":
+                        collected_text += (message_content if message_content else "") + "\n"
+                    elif message_type in ("photo", "voice", "document"):
+                        if message_content:
+                            collected_text += message_content + "\n"
+                        try:
+                            if message_type == "photo":
+                                file = await bot.get_file(file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                                file_info['file_name'] = f"photo_{uuid.uuid4()}.jpg"
+                            elif message_type == "voice":
+                                file = await bot.get_file(file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                            elif message_type == "document":
+                                file = await bot.get_file(file_info['file_id'])
+                                file_bytes = await file.download_as_bytearray()
+                            upload_result = await upload_file_to_dify(bytes(file_bytes), file_info['file_name'],
+                                                                    file_info['mime_type'], user_id)
+                            if upload_result and upload_result.get("id"):
+                                collected_files.append({"type": file_info['file_type'], "transfer_method": "local_file",
+                                                        "upload_file_id": upload_result["id"]})
+                        except Exception as e:
+                            print(f"文件上传/处理错误: {e}")
+                            await bot.send_message(chat_id=chat_id, text="处理文件的时候出了点小问题...")
+
+                # 5. 发送合并后的消息
                 try:
-                    await bot.send_message(chat_id=chat_id, text="处理消息时发生错误，请稍后再试。")
-                except:
+                    if collected_text.strip() or collected_files:
+                        print(f"合并消息: {collected_text}, 文件: {collected_files}")
+                        
+                        # 使用超时机制避免永久阻塞
+                        async with asyncio.timeout(DIFY_TIMEOUT['stream'] + 30):  # 给予额外30秒余量
+                            await dify_stream_response(collected_text.strip(), chat_id, bot, files=collected_files)
+                            print(f"用户 {user_id} 的消息已成功处理")
+                except asyncio.TimeoutError:
+                    print(f"处理用户 {user_id} 消息超时")
+                    await bot.send_message(chat_id=chat_id, text="处理消息时超时，请稍后再试。")
+                except TimedOut as e:
+                    print(f"Error in process_message_queue during dify_stream_response: {e}")
+                    await message_queue.put((update, context, message_type, message_content, file_info))
+                except Exception as e:
+                    print(f"Error in process_message_queue during dify_stream_response: {e}")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text="处理消息时发生错误，请稍后再试。")
+                    except:
+                        pass
+
+                # 处理完消息后等待 rate_limit 秒
+                print(f"用户 {user_id} 消息处理完成，等待 {rate_limit} 秒后处理下一条消息")
+                await asyncio.sleep(rate_limit)
+                
+                # 处理完成后标记任务完成
+                for _ in range(len(current_user_queue)):
+                    message_queue.task_done()
+                    
+                # 更新活动时间和成功处理时间
+                last_activity_time = time.time()
+                last_successful_process = time.time()
+                
+            except TimedOut as e:
+                print(f"TimedOut in process_message_queue: {e}")
+                # 对于超时错误，我们重新放回队列尝试稍后再处理
+                message_queue.task_done()  # 先标记当前任务完成
+                await message_queue.put((update, context, message_type, message_content, file_info))
+                await asyncio.sleep(5)  # 等待一段时间后继续
+                
+            except (NetworkError, TelegramError) as e:
+                print(f"Network error in process_message_queue: {e}")
+                # 对于网络错误，我们不重新放回队列，但会通知用户
+                try:
+                    if getattr(bot, '_initialized', False):  # 确保 bot 仍然可用
+                        await bot.send_message(chat_id=chat_id, text="网络连接问题，请稍后重新发送消息。")
+                except Exception:
                     pass
-
-            # 处理完消息后等待 rate_limit 秒
-            print(f"用户 {user_id} 消息处理完成，等待 {rate_limit} 秒后处理下一条消息")
-            await asyncio.sleep(rate_limit)
-
-            # 只在处理完所有消息后调用一次 task_done
-            for _ in range(len(current_user_queue)):
                 message_queue.task_done()
-
+                await asyncio.sleep(5)
+                
+            except Exception as e:
+                print(f"Unexpected error in process_message_queue: {e}")
+                # 对于其他错误，我们标记任务完成但不重试
+                message_queue.task_done()
+                await asyncio.sleep(5)
+                
+        except asyncio.CancelledError:
+            # 任务被取消时正常退出
+            print("消息处理队列任务被取消")
+            break
+            
         except Exception as e:
-            print(f"Unexpected error in process_message_queue: {e}")
-            await asyncio.sleep(5)
-            continue
+            # 捕获队列操作本身的错误
+            print(f"Critical error in process_message_queue main loop: {e}")
+            await asyncio.sleep(10)
+            # 更新成功处理时间以避免误判
+            last_successful_process = time.time()
 
 
 async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -837,69 +959,136 @@ class TelegramConnectionMonitor:
         self.heartbeat_timeout = 120
         self.base_retry_delay = 10  # 基础重试延迟
         self.max_retry_delay = 300  # 最大重试延迟
+        self._stop_event = asyncio.Event()  # 添加停止事件
+        self.last_message_processed_time = time.time()  # 添加最后消息处理时间
+        self.last_message_queue_size = 0  # 记录上次消息队列大小
 
     async def start_monitoring(self):
-        """启动连接监控"""
-        self._monitor_task = asyncio.create_task(self._run_health_check())
+        """启动连接状态监控。"""
+        self._monitor_task = asyncio.create_task(self._monitor_connection())
+        print("Connection monitoring started")
 
     async def stop_monitoring(self):
-        """停止连接监控"""
+        """停止连接状态监控。"""
         if self._monitor_task:
+            self._stop_event.set()
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
             self._monitor_task = None
+            print("Connection monitoring stopped")
 
-    async def _run_health_check(self):
-        """运行健康检查，无限重试"""
-        while True:
+    async def _monitor_connection(self):
+        """定期检查连接状态。"""
+        check_interval = 30  # 检查间隔（秒）
+        while not self._stop_event.is_set():
             try:
-                async with httpx.AsyncClient(
-                    proxy=TELEGRAM_PROXY['url'],
-                    timeout=30.0
-                ) as client:
-                    await self.application.bot.get_me()
-
-                # 连接成功，重置状态
-                self.last_heartbeat = time.time()
-                if not self.is_healthy:
-                    print("Connection health restored")
-                    self.is_healthy = True
-                    self.consecutive_failures = 0
-                    if not self.is_connected:
-                        asyncio.create_task(self._trigger_reconnect())
-
-            except Exception as e:
-                self.consecutive_failures += 1
-                retry_delay = min(self.base_retry_delay * (2 ** (self.consecutive_failures - 1)), self.max_retry_delay)
-                print(f"Connection health check failed (attempt {self.consecutive_failures}). "
-                      f"Retrying in {retry_delay} seconds. Error: {e}")
+                # 尝试向 Telegram 发送一个简单请求以检查连接
+                await self._check_connection()
                 
+                # 记录最后一次成功的心跳时间
                 if self.is_healthy:
-                    print("Connection considered unhealthy")
-                    self.is_healthy = False
+                    self.last_heartbeat = time.time()
+                    self.consecutive_failures = 0
                 
-                # 无论失败多少次都继续尝试重连
-                asyncio.create_task(self._trigger_reconnect())
-                await asyncio.sleep(retry_delay)
-                continue
-
-            # 正常检查间隔
-            await asyncio.sleep(30)
+                # 如果已经超时未收到心跳，将标记为不健康
+                elapsed = time.time() - self.last_heartbeat
+                if elapsed > self.heartbeat_timeout and self.is_healthy:
+                    print(f"Connection considered unhealthy: No heartbeat for {elapsed:.1f} seconds")
+                    self.is_healthy = False
+                    await self._trigger_reconnect()
+                
+                # 等待指定时间再检查
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                # 任务被取消时退出
+                break
+            except Exception as e:
+                print(f"Error in connection monitor: {e}")
+                # 发生错误时等待较短的时间，以便更快地重新检查
+                await asyncio.sleep(5)
+                
+    async def _check_connection(self):
+        """检查连接是否健康。"""
+        global last_activity_time, message_queue_task
+        
+        try:
+            # 尝试向 Telegram 发送一个简单的 getMe 请求
+            if not self.application.bot:
+                print("Bot is not available, cannot check connection")
+                self.is_healthy = False
+                return
+                
+            attempt = self.consecutive_failures + 1
+            print(f"Checking connection health (attempt {attempt})...")
+            
+            # 检查消息队列状态 - 即使队列大小没变，仍然有消息在被处理
+            current_queue_size = message_queue.qsize()
+            current_time = time.time()
+            
+            # 更新全局活动时间 - 执行健康检查本身就是一种活动
+            last_activity_time = current_time
+            
+            # 如果队列大小长时间不变且不为空，可能表示处理停滞
+            if (current_queue_size > 0 and 
+                current_queue_size == self.last_message_queue_size and
+                current_time - self.last_message_processed_time > 300):  # 5分钟无变化
+                print(f"消息队列大小 {current_queue_size} 在过去5分钟没有变化，可能处理停滞")
+                self.is_healthy = False
+                self.consecutive_failures += 1
+                return
+                
+            self.last_message_queue_size = current_queue_size
+            
+            # 设置超时，防止请求卡住
+            try:
+                async with asyncio.timeout(30):  # 30秒超时
+                    me = await self.application.bot.get_me()
+            except asyncio.TimeoutError:
+                print(f"Connection health check timed out after 30 seconds")
+                self.is_healthy = False
+                self.consecutive_failures += 1
+                return
+            
+            # 检查成功，更新状态
+            print(f"Connection health check successful: @{me.username}")
+            self.is_healthy = True
+            self.last_heartbeat = current_time  # 更新心跳时间
+            last_activity_time = current_time  # 更新活动时间
+            self.consecutive_failures = 0  # 重置失败计数
+            
+        except Exception as e:
+            # 记录错误并增加失败计数
+            retry_delay = min(self.base_retry_delay * (2 ** min(self.consecutive_failures, 4)), self.max_retry_delay)
+            print(f"Connection health check failed (attempt {attempt}). Retrying in {retry_delay} seconds. Error: {e}")
+            self.is_healthy = False
+            self.consecutive_failures += 1
 
     async def _trigger_reconnect(self):
         """触发重连流程，无限重试"""
-        global message_queue_task  # 只在方法开头声明一次
+        global message_queue_task, last_activity_time
         
         async with self._reconnect_lock:
             if not self.is_healthy and self.is_connected:
                 self.is_connected = False
                 print("Triggering reconnection...")
                 
-                # 保存状态
+                # 保存所有重要状态
                 save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                print("状态数据已保存")
+                
+                # 保存当前未处理的消息队列
+                queue_backup = []
+                while not message_queue.empty():
+                    try:
+                        queue_item = message_queue.get_nowait()
+                        queue_backup.append(queue_item)
+                    except asyncio.QueueEmpty:
+                        break
+                    
+                print(f"已备份 {len(queue_backup)} 条待处理消息")
 
                 # 停止当前的消息处理队列任务
                 if message_queue_task and not message_queue_task.done():
@@ -911,53 +1100,139 @@ class TelegramConnectionMonitor:
                     message_queue_task = None
                     print("消息处理队列已停止")
 
+                reconnect_attempt = 0
                 while True:  # 无限重试循环
+                    reconnect_attempt += 1
                     try:
-                        # 确保完全停止当前应用
-                        if self.application.running:
+                        print(f"尝试重连 (第 {reconnect_attempt} 次)...")
+                        # 完全关闭旧实例
+                        if hasattr(self.application, 'running') and self.application.running:
                             try:
-                                await self.application.updater.stop()
+                                await self.stop_monitoring()  # 先停止监控
+                                if hasattr(self.application, 'updater') and self.application.updater:
+                                    await self.application.updater.stop()
                                 await self.application.stop()
-                                await self.application.shutdown()  # 添加完全关闭
+                                if hasattr(self.application, 'shutdown'):
+                                    await self.application.shutdown()
                                 print("Application stopped successfully")
                             except Exception as e:
                                 print(f"Error stopping application: {e}")
 
                         # 等待一段时间确保旧实例完全关闭
-                        await asyncio.sleep(10)
-
-                        # 重新初始化应用
-                        await self.application.initialize()
-                        await self.application.start()
-                        await self.application.updater.start_polling(
-                            poll_interval=1.0,
-                            bootstrap_retries=-1,  # 无限重试
-                            allowed_updates=["message", "callback_query"]
-                        )
+                        await asyncio.sleep(15)
                         
-                        print("Application restarted successfully")
-                        self.is_connected = True
-                        self.is_healthy = True
-                        self.consecutive_failures = 0
-
-                        # 重新启动消息处理队列 - 移除这里的 global 声明
+                        # 重新创建更健壮的应用实例
+                        await self._recreate_application()
+                        
+                        # 恢复消息队列
+                        for item in queue_backup:
+                            await message_queue.put(item)
+                        print(f"已恢复 {len(queue_backup)} 条待处理消息到队列")
+                        
+                        # 启动新的消息处理队列
                         message_queue_task = asyncio.create_task(process_message_queue(self.application))
                         print("消息处理队列已重新启动")
                         
+                        # 重新开始监控
+                        await self.start_monitoring()
+                        
+                        # 更新状态
+                        self.is_connected = True
+                        self.is_healthy = True
+                        self.consecutive_failures = 0
+                        last_activity_time = time.time()  # 更新活动时间
+                        
                         break  # 重连成功，退出重试循环
-
                     except Exception as e:
-                        print(f"Error during reconnection attempt: {e}")
-                        await asyncio.sleep(10)  # 失败后等待更长时间
+                        print(f"重连尝试 {reconnect_attempt} 失败: {e}")
+                        # 随机等待时间，避免所有客户端同时重连
+                        retry_delay = min(self.base_retry_delay * (2 ** min(reconnect_attempt % 10, 4)) + random.uniform(0, 5), self.max_retry_delay)
+                        print(f"将在 {retry_delay:.1f} 秒后重试...")
+                        await asyncio.sleep(retry_delay)
                         continue
+    
+    async def _recreate_application(self):
+        """重新创建应用实例"""
+        global telegram_application, conversation_ids_by_user, api_keys, user_api_keys, blocked_users, conversation_history
+        
+        # 重新加载保存的数据
+        try:
+            loaded_data = load_data()
+            if loaded_data:
+                loaded_conversation_ids, loaded_api_keys, loaded_user_api_keys, loaded_blocked_users = loaded_data
+                # 合并数据，保留内存中未保存的数据
+                for key, value in loaded_conversation_ids.items():
+                    conversation_ids_by_user[key] = value
+                api_keys.update(loaded_api_keys)
+                user_api_keys.update(loaded_user_api_keys)
+                blocked_users.update(loaded_blocked_users)
+                print("已从文件恢复状态数据")
+        except Exception as e:
+            print(f"加载保存的数据时出错: {e}")
+        
+        # 创建新的 Application 实例
+        try:
+            # 创建请求对象
+            request = HTTPXRequest(
+                proxy=TELEGRAM_PROXY.get('url'),
+                connect_timeout=TELEGRAM_PROXY.get('connect_timeout', 60),
+                read_timeout=TELEGRAM_PROXY.get('read_timeout', 60),
+                write_timeout=TELEGRAM_PROXY.get('write_timeout', 60),
+                pool_timeout=TELEGRAM_PROXY.get('pool_timeout', 120),
+                connection_pool_size=TELEGRAM_PROXY.get('pool_connections', 20)
+            )
+            
+            telegram_application = (
+                Application.builder()
+                .token(TELEGRAM_BOT_TOKEN)
+                .request(request)
+                .build()
+            )
+            
+            # 手动初始化请求对象
+            if hasattr(telegram_application.bot, 'request') and not getattr(telegram_application.bot.request, '_initialized', False):
+                print("手动初始化Bot的请求对象")
+                await telegram_application.bot.initialize()
+            
+            # 注册处理函数
+            register_handlers(telegram_application)
+            
+            # 初始化和启动
+            await init_db()
+            await telegram_application.initialize()
+            
+            # 确保Bot已初始化
+            if not getattr(telegram_application.bot, '_initialized', False):
+                print("手动初始化Bot")
+                await telegram_application.bot.initialize()
+            
+            # 启动应用和轮询
+            await telegram_application.start()
+            await telegram_application.updater.start_polling(
+                poll_interval=1.0,
+                bootstrap_retries=-1,
+                timeout=60,
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60,
+                pool_timeout=60,
+                allowed_updates=["message", "callback_query"]
+            )
+            
+            # 更新实例引用
+            self.application = telegram_application
+            print("应用程序重启成功")
+            
+        except Exception as e:
+            print(f"创建应用程序实例时出错: {e}")
+            raise
 
 async def connect_telegram():
     """连接 Telegram 机器人，无限重试"""
-    global telegram_application, message_queue_task
+    global telegram_application, message_queue_task, connection_monitor
     base_retry_delay = 10
     max_retry_delay = 300
     retry_count = 0
-    connection_monitor = None
 
     while True:
         try:
@@ -980,7 +1255,9 @@ async def connect_telegram():
                         proxy=TELEGRAM_PROXY['url'],
                         connect_timeout=TELEGRAM_PROXY['connect_timeout'],
                         read_timeout=TELEGRAM_PROXY['read_timeout'],
-                        write_timeout=TELEGRAM_PROXY['write_timeout']
+                        write_timeout=TELEGRAM_PROXY['write_timeout'],
+                        pool_timeout=TELEGRAM_PROXY.get('pool_timeout', 120),
+                        connection_pool_size=TELEGRAM_PROXY.get('pool_connections', 20)  # 使用正确的参数而不是 limits
                     )
                 )
                 .build()
@@ -1004,7 +1281,12 @@ async def connect_telegram():
                     
                     await telegram_application.updater.start_polling(
                         poll_interval=1.0,
-                        bootstrap_retries=-1,  # 无限重试
+                        bootstrap_retries=-1,
+                        timeout=60,
+                        read_timeout=60,
+                        write_timeout=60,
+                        connect_timeout=60,
+                        pool_timeout=60,
                         allowed_updates=["message", "callback_query"]
                     )
 
@@ -1059,22 +1341,270 @@ async def connect_telegram():
             print("Attempting to reconnect...")
             continue
 
-async def main() -> None:
-    """主函数。"""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        print("请设置 TELEGRAM_BOT_TOKEN")
-        return
-    if not DIFY_API_URL or DIFY_API_URL == "YOUR_DIFY_API_URL":
-        print("请设置 DIFY_API_URL")
-        return
+async def main():
+    """主函数"""
+    global telegram_application, connection_monitor, message_queue_task, last_activity_time
+    
+    # 最外层无限重试循环
+    consecutive_failures = 0
+    max_failures = 10  # 允许的最大连续失败次数
+    
+    while True:
+        try:
+            # 加载保存的数据
+            load_data()
+            
+            # 初始化数据库
+            await init_db()
+            
+            # 创建并配置 Telegram 应用
+            request = HTTPXRequest(
+                proxy=TELEGRAM_PROXY.get('url'),
+                connect_timeout=TELEGRAM_PROXY.get('connect_timeout', 60),
+                read_timeout=TELEGRAM_PROXY.get('read_timeout', 60),
+                write_timeout=TELEGRAM_PROXY.get('write_timeout', 60),
+                pool_timeout=TELEGRAM_PROXY.get('pool_timeout', 120),
+                connection_pool_size=TELEGRAM_PROXY.get('pool_connections', 20)
+            )
+            
+            telegram_application = (
+                Application.builder()
+                .token(TELEGRAM_BOT_TOKEN)
+                .request(request)
+                .build()
+            )
+            
+            # 注册处理函数
+            register_handlers(telegram_application)
+            
+            # 启动应用程序
+            await telegram_application.initialize()
+            await telegram_application.start()
+            await telegram_application.updater.start_polling(
+                poll_interval=1.0,
+                bootstrap_retries=-1,
+                timeout=60,
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60,
+                pool_timeout=60,
+                allowed_updates=["message", "callback_query"]
+            )
+            
+            # 启动连接监控
+            connection_monitor = TelegramConnectionMonitor(telegram_application)
+            await connection_monitor.start_monitoring()
+            
+            # 启动消息处理队列
+            message_queue_task = asyncio.create_task(process_message_queue(telegram_application))
+            
+            # 启动看门狗监控
+            watchdog_task = asyncio.create_task(watchdog_monitor())
+            
+            # 启动数据清理任务
+            cleanup_task = asyncio.create_task(cleanup_old_data())
+            
+            # 更新最后活动时间
+            last_activity_time = time.time()
+            
+            # 重置连续失败计数
+            consecutive_failures = 0
+            
+            # 等待任务完成（实际上会一直运行）
+            await asyncio.gather(
+                message_queue_task,
+                watchdog_task,
+                cleanup_task
+            )
+            
+        except Exception as e:
+            consecutive_failures += 1
+            print(f"严重错误，整个系统将重启 (连续失败: {consecutive_failures}/{max_failures}): {e}")
+            
+            # 记录带有堆栈跟踪的详细错误
+            import traceback
+            print(f"错误详情: {traceback.format_exc()}")
+            
+            # 保存数据
+            try:
+                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+            except Exception as save_error:
+                print(f"保存数据时出错: {save_error}")
+            
+            # 清理资源
+            try:
+                # 停止消息处理任务
+                if message_queue_task and not message_queue_task.done():
+                    message_queue_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(message_queue_task), timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                
+                # 停止连接监控
+                if connection_monitor:
+                    await connection_monitor.stop_monitoring()
+                
+                # 停止应用程序
+                if telegram_application and telegram_application.running:
+                    await telegram_application.stop()
+                    
+                print("资源清理完成")
+            except Exception as cleanup_error:
+                print(f"清理资源时出错: {cleanup_error}")
+            
+            # 如果连续失败次数过多，增加延迟或进行特殊处理
+            retry_delay = min(30 * (2 ** min(consecutive_failures, 4)), 600) + random.uniform(0, 10)
+            print(f"将在 {retry_delay:.1f} 秒后重启系统...")
+            await asyncio.sleep(retry_delay)
+            print("正在重启系统...")
+            continue  # 继续循环，重新开始
 
-    # 启动清理任务
-    cleanup_task = asyncio.create_task(cleanup_old_data())
 
-    try:
-        await connect_telegram()
-    finally:
-        cleanup_task.cancel()  # 确保清理任务在程序退出时被取消
+# 添加看门狗监控函数
+async def watchdog_monitor():
+    """看门狗监控函数，检测系统是否长时间无响应"""
+    global last_activity_time, conversation_ids_by_user, message_queue_task, last_message_queue_size
+    
+    # 添加消息处理任务监控
+    last_conversation_ids_count = len(conversation_ids_by_user)
+    last_check_time = time.time()
+    last_queue_process_time = time.time()
+    last_queue_size = message_queue.qsize() if message_queue else 0
+    message_process_timeout = 600  # 10分钟
+    
+    while True:
+        try:
+            await asyncio.sleep(60)  # 每分钟检查一次
+            
+            current_time = time.time()
+            elapsed = current_time - last_activity_time
+            
+            # 监控对话ID状态变化
+            current_conversation_ids_count = len(conversation_ids_by_user)
+            if current_conversation_ids_count != last_conversation_ids_count:
+                print(f"对话ID数量发生变化: {last_conversation_ids_count} -> {current_conversation_ids_count}")
+                last_conversation_ids_count = current_conversation_ids_count
+                # 如果数量变化，认为系统是活跃的
+                last_activity_time = current_time
+            
+            # 检查消息队列状态
+            current_queue_size = message_queue.qsize() if message_queue else 0
+            queue_changed = current_queue_size != last_queue_size
+            
+            # 检查消息队列，如果有消息待处理，认为系统是活跃的
+            if not message_queue.empty():
+                queue_size = message_queue.qsize()
+                print(f"看门狗检测到消息队列中有 {queue_size} 条消息等待处理")
+                
+                # 检查队列大小是否长时间不变
+                if (queue_size > 0 and queue_size == last_queue_size and 
+                    current_time - last_queue_process_time > message_process_timeout):
+                    print(f"警告: 消息队列大小 {queue_size} 已 {current_time - last_queue_process_time:.1f} 秒无变化")
+                    print("看门狗认为消息处理任务可能已卡住，尝试重启消息处理任务")
+                    
+                    # 尝试重启消息处理任务
+                    if message_queue_task and not message_queue_task.done():
+                        # 取消现有任务
+                        try:
+                            message_queue_task.cancel()
+                            await asyncio.sleep(5)  # 等待任务取消
+                        except Exception as e:
+                            print(f"取消消息处理任务时出错: {e}")
+                            
+                    # 创建新的消息处理任务
+                    print("创建新的消息处理任务")
+                    message_queue_task = asyncio.create_task(process_message_queue(telegram_application))
+                    last_queue_process_time = current_time  # 重置时间
+                    last_activity_time = current_time  # 更新活动时间
+                    print("消息处理任务已重启")
+                
+                if queue_changed:
+                    last_queue_size = current_queue_size
+                    last_queue_process_time = current_time
+                    last_activity_time = current_time  # 更新活动时间
+                    continue
+                
+            # 检查消息处理任务状态
+            if message_queue_task and not message_queue_task.done():
+                # 验证任务实际在运行，不仅仅是存在
+                if connection_monitor and current_time - connection_monitor.last_message_processed_time < 300:
+                    print(f"看门狗检测到消息处理任务活跃（{(current_time - connection_monitor.last_message_processed_time):.1f}秒前有活动），重置活动时间")
+                    last_activity_time = current_time
+                    continue
+                else:
+                    # 任务存在但可能已经长时间无活动（5分钟以上）
+                    if current_time - connection_monitor.last_message_processed_time > 300:
+                        print(f"警告: 消息处理任务已 {current_time - connection_monitor.last_message_processed_time:.1f} 秒无活动，可能已卡住")
+                        print("触发系统完全重启...")
+                        
+                        # 不只是重启消息处理任务，而是触发整个系统重连
+                        if connection_monitor:
+                            connection_monitor.is_healthy = False
+                            try:
+                                await connection_monitor._trigger_reconnect()
+                                last_activity_time = current_time  # 更新活动时间
+                                print("系统完全重启流程已启动")
+                            except Exception as e:
+                                print(f"系统重启失败: {e}")
+                                # 触发主循环重启
+                                raise Exception("触发主循环重启")
+                        else:
+                            # 直接触发主循环重启
+                            raise Exception("触发主循环重启 - 无连接监控器")
+            else:
+                # 消息处理任务不存在或已完成，需要重新创建
+                if not message_queue_task or message_queue_task.done():
+                    print("消息处理任务不存在或已完成，创建新任务")
+                    message_queue_task = asyncio.create_task(process_message_queue(telegram_application))
+                    last_activity_time = current_time  # 更新活动时间
+            
+            # 定期保存状态数据，即使没有变化
+            if current_time - last_check_time > 300:  # 每5分钟自动保存一次
+                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                print("看门狗定期保存状态数据完成")
+                last_check_time = current_time
+            
+            if elapsed > WATCHDOG_TIMEOUT:
+                print(f"看门狗检测到系统 {elapsed:.1f} 秒无活动，触发重启...")
+                
+                # 在重启前保存所有状态
+                save_data(conversation_ids_by_user, api_keys, user_api_keys, blocked_users)
+                print("看门狗在重启前保存了状态数据")
+                
+                # 强制重启整个系统
+                if telegram_application:
+                    # 尝试触发 connection_monitor 的重连逻辑
+                    if connection_monitor:
+                        connection_monitor.is_healthy = False
+                        try:
+                            await connection_monitor._trigger_reconnect()
+                            # 重置活动时间，避免立即再次触发
+                            last_activity_time = time.time()
+                        except Exception as e:
+                            print(f"看门狗触发重连失败: {e}")
+                            # 如果触发重连失败，直接抛出异常，让主循环处理重启
+                            raise Exception("Watchdog forced restart")
+                else:
+                    # 如果没有 telegram_application，也抛出异常让主循环处理
+                    raise Exception("Watchdog forced restart - no application")
+            
+            # 如果已经超过 WATCHDOG_TIMEOUT 的一半时间无活动，记录警告
+            elif elapsed > WATCHDOG_TIMEOUT / 2:
+                print(f"警告: 系统已 {elapsed:.1f} 秒无活动")
+                # 检查系统基本状态
+                print(f"系统状态: 队列大小={message_queue.qsize()}, 对话数量={len(conversation_ids_by_user)}")
+                print(f"消息处理任务状态: {'运行中' if message_queue_task and not message_queue_task.done() else '未运行'}")
+                if connection_monitor:
+                    print(f"连接状态: {'健康' if connection_monitor.is_healthy else '不健康'}, " 
+                          f"最后心跳={current_time - connection_monitor.last_heartbeat:.1f}秒前, "
+                          f"最后处理消息={current_time - connection_monitor.last_message_processed_time:.1f}秒前")
+                
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"看门狗监控出错: {e}")
+            await asyncio.sleep(30)  # 出错后等待一段时间再继续
 
 
 # 修改 button_callback 函数
@@ -1388,6 +1918,18 @@ async def cleanup_old_data():
 
         await asyncio.sleep(3600)  # 每小时清理一次
 
+# 添加这个函数来注册所有处理程序
+def register_handlers(app):
+    """注册所有消息处理程序"""
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("set", set_api_key))
+    app.add_handler(CommandHandler("block", block_user))
+    app.add_handler(CommandHandler("unblock", unblock_user))
+    app.add_handler(CommandHandler("clean", clean_conversations))
+    app.add_handler(CommandHandler("save", save_memory_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    print("所有处理程序已注册")
 
 if __name__ == "__main__":
     try:
